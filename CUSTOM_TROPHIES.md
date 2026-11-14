@@ -88,6 +88,16 @@ mapped, the condition is simply false.
 * `trophy(n)` - 1 if trophy number `n` is unlocked: `trophy(14) == 1 && trophy(15) == 1` makes a
   trophy for earning a group of others.
 
+* `button(cross)` - 1 while that controller button is held (player 1). Names: `cross` (or `x`),
+  `circle`, `square`, `triangle`, `l1 l2 l3 r1 r2 r3`, `start`, `select`, `up down left right`.
+* `count(x)` - how many times `x` has gone from false to true. The total is saved, so it carries
+  on across sessions: `count(button(cross)) >= 1000` is "press X a thousand times".
+  A comparison is allowed inside the brackets: `count([0x1000] > 5) >= 3`. To combine two things
+  inside brackets use `*` for "and": `count(button(cross) * ([0x1000] == 2)) >= 100` counts
+  presses only while `[0x1000]` is 2 (say, while in a level rather than a menu).
+
+Rules that use `button()` are checked every frame rather than four times a second.
+
 ### Sequences
 
 ```yaml

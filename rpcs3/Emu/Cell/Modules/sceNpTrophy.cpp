@@ -19,11 +19,14 @@
 
 #include "Utilities/StrUtil.h"
 #include "util/yaml.hpp"
+#include "Emu/Io/pad_types.h"
+#include "Input/pad_thread.h"
 
 #include "Emu/Cell/lv2/sys_event.h"
 #include "Emu/Cell/lv2/sys_fs.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -330,6 +333,9 @@ enum ct_op_type : u8
 	ct_delta,  // value minus what it was when first read this session
 	ct_prev,   // value at the previous check
 	ct_trophy, // 1 if that trophy id is unlocked, else 0
+	ct_cmp,    // comparison inside brackets, gives 1 or 0
+	ct_count,  // how many times the value went from zero to non-zero (kept between sessions)
+	ct_button, // 1 while that controller button is held
 };
 
 struct ct_op
@@ -343,6 +349,7 @@ struct ct_op
 	// Remembered between checks by ct_delta and ct_prev
 	f64 state = 0;
 	bool has_state = false;
+	bool flag = false;
 };
 
 enum ct_cmp_type : u8
@@ -414,6 +421,10 @@ struct ct_rules_set
 	u64 last_check = 0;
 	u64 next_progress_write = 0;
 	bool progress_dirty = false;
+	bool fast = false;       // has button() rules: checked every frame instead of 4x a second
+	bool has_counts = false; // has count() rules: totals are saved to disk
+	f64 saved_counts = -1;
+	u64 next_counts_write = 0;
 	bool loaded = false;
 	bool platinum_checked = false;
 	s32 original_count = -1;
@@ -492,6 +503,66 @@ struct ct_parser
 	{
 		skip();
 		return pos >= s.size();
+	}
+
+	// expr [compare expr], for use inside brackets: "count([0x1000] > 5)"
+	bool cmp_expr()
+	{
+		if (!expr())
+		{
+			return false;
+		}
+
+		skip();
+
+		const std::string_view rest = s.substr(pos);
+		u8 cmp = ct_eq;
+
+		if (rest.starts_with("=="))
+		{
+			cmp = ct_eq;
+			pos += 2;
+		}
+		else if (rest.starts_with("!="))
+		{
+			cmp = ct_ne;
+			pos += 2;
+		}
+		else if (rest.starts_with(">="))
+		{
+			cmp = ct_ge;
+			pos += 2;
+		}
+		else if (rest.starts_with("<="))
+		{
+			cmp = ct_le;
+			pos += 2;
+		}
+		else if (rest.starts_with(">"))
+		{
+			cmp = ct_gt;
+			pos += 1;
+		}
+		else if (rest.starts_with("<"))
+		{
+			cmp = ct_lt;
+			pos += 1;
+		}
+		else
+		{
+			return true;
+		}
+
+		if (!expr())
+		{
+			return false;
+		}
+
+		ct_op op{};
+		op.type = ct_cmp;
+		op.value = cmp;
+		out->push_back(op);
+		return true;
 	}
 
 	bool expr()
@@ -575,7 +646,7 @@ struct ct_parser
 
 		if (eat('('))
 		{
-			return expr() && eat(')');
+			return cmp_expr() && eat(')');
 		}
 
 		if (eat('-'))
@@ -601,6 +672,8 @@ struct ct_parser
 			{"delta", ct_delta},
 			{"prev", ct_prev},
 			{"trophy", ct_trophy},
+			{"count", ct_count},
+			{"button", ct_button},
 		};
 
 		for (const auto& [name, type] : s_funcs)
@@ -618,13 +691,64 @@ struct ct_parser
 				{
 					pos = next + 1;
 
-					if (!expr() || !eat(')'))
+					ct_op func{};
+					func.type = type;
+
+					if (type == ct_button)
+					{
+						// button(cross): the argument is a name, not a number
+						skip();
+
+						std::string button;
+
+						while (pos < s.size() && ((s[pos] >= 'a' && s[pos] <= 'z') || (s[pos] >= 'A' && s[pos] <= 'Z') || (s[pos] >= '0' && s[pos] <= '9')))
+						{
+							const char c = s[pos++];
+							button += (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
+						}
+
+						struct button_name
+						{
+							std::string_view name;
+							u8 offset; // 2 = digital1, 3 = digital2
+							u32 code;
+						};
+
+						static constexpr button_name s_buttons[] =
+						{
+							{"select", 2, 0x01}, {"l3", 2, 0x02}, {"r3", 2, 0x04}, {"start", 2, 0x08},
+							{"up", 2, 0x10}, {"right", 2, 0x20}, {"down", 2, 0x40}, {"left", 2, 0x80},
+							{"l2", 3, 0x01}, {"r2", 3, 0x02}, {"l1", 3, 0x04}, {"r1", 3, 0x08},
+							{"triangle", 3, 0x10}, {"circle", 3, 0x20}, {"cross", 3, 0x40}, {"x", 3, 0x40}, {"square", 3, 0x80},
+						};
+
+						bool found = false;
+
+						for (const button_name& entry : s_buttons)
+						{
+							if (button == entry.name)
+							{
+								func.size = entry.offset;
+								func.value = entry.code;
+								found = true;
+								break;
+							}
+						}
+
+						if (!found || !eat(')'))
+						{
+							return false;
+						}
+
+						out->push_back(func);
+						return true;
+					}
+
+					if (!cmp_expr() || !eat(')'))
 					{
 						return false;
 					}
 
-					ct_op func{};
-					func.type = type;
 					out->push_back(func);
 					return true;
 				}
@@ -928,6 +1052,80 @@ static bool ct_eval(std::vector<ct_op>& ops, const ct_eval_ctx& ctx, f64& result
 				}
 			}
 
+			break;
+		}
+		case ct_button:
+		{
+			if (sp >= std::size(stack))
+			{
+				return false;
+			}
+
+			bool pressed = false;
+
+			{
+				std::lock_guard pad_lock(pad::g_pad_mutex);
+
+				if (const auto handler = pad::get_pad_thread(true))
+				{
+					if (const auto& pad = handler->GetPads()[0])
+					{
+						for (const Button& button : pad->m_buttons)
+						{
+							if (button.m_pressed && button.m_offset == op.size && button.m_outKeyCode == static_cast<u32>(op.value))
+							{
+								pressed = true;
+								break;
+							}
+						}
+					}
+				}
+			}
+
+			stack[sp++] = pressed ? 1 : 0;
+			break;
+		}
+		case ct_cmp:
+		{
+			if (sp < 2)
+			{
+				return false;
+			}
+
+			const f64 b = stack[--sp];
+			const f64 a = stack[sp - 1];
+			bool ok = false;
+
+			switch (static_cast<u8>(op.value))
+			{
+			case ct_eq: ok = a == b; break;
+			case ct_ne: ok = a != b; break;
+			case ct_ge: ok = a >= b; break;
+			case ct_le: ok = a <= b; break;
+			case ct_gt: ok = a > b; break;
+			case ct_lt: ok = a < b; break;
+			default: break;
+			}
+
+			stack[sp - 1] = ok ? 1 : 0;
+			break;
+		}
+		case ct_count:
+		{
+			if (sp < 1)
+			{
+				return false;
+			}
+
+			const bool truthy = stack[sp - 1] != 0;
+
+			if (truthy && !op.flag)
+			{
+				op.state += 1;
+			}
+
+			op.flag = truthy;
+			stack[sp - 1] = op.state;
 			break;
 		}
 		case ct_delta:
@@ -1573,6 +1771,144 @@ static u32 ct_merge_custom(ct_rules_set& set, const std::string& trp_name)
 	return count + static_cast<u32>(set.custom.size());
 }
 
+// Calls func(rule id, op) for every operation of every rule, always in the same order
+template <typename F>
+static void ct_for_each_op(ct_rules_set& set, F&& func)
+{
+	const auto walk_step = [&](s32 id, ct_step& step)
+	{
+		for (ct_clause& clause : step.clauses)
+		{
+			for (ct_alt& alt : clause)
+			{
+				for (ct_condition& cond : alt)
+				{
+					for (ct_op& op : cond.lhs)
+					{
+						func(id, op);
+					}
+
+					for (ct_op& op : cond.rhs)
+					{
+						func(id, op);
+					}
+				}
+			}
+		}
+	};
+
+	for (ct_rule& rule : set.rules)
+	{
+		for (ct_step& step : rule.steps)
+		{
+			walk_step(rule.id, step);
+		}
+
+		walk_step(rule.id, rule.reset);
+	}
+}
+
+static std::string ct_counts_path(const std::string& trp_name)
+{
+	return vfs::get("/dev_hdd0/home/" + Emu.GetUsr() + "/trophy_rules/" + trp_name + "_counts.txt");
+}
+
+// count() totals survive restarts. One line per counter: "<trophy id> <nth count() of that rule> <total>"
+static void ct_load_counts(ct_rules_set& set, const std::string& trp_name)
+{
+	set.fast = false;
+	set.has_counts = false;
+
+	std::map<std::pair<s32, u32>, f64> saved;
+
+	if (fs::file file{ct_counts_path(trp_name)})
+	{
+		for (const std::string& line : fmt::split(file.to_string(), {"\n", "\r"}))
+		{
+			int id = 0;
+			unsigned index = 0;
+			double total = 0;
+
+			if (std::sscanf(line.c_str(), "%d %u %lf", &id, &index, &total) == 3 && total >= 0)
+			{
+				saved[{id, index}] = total;
+			}
+		}
+	}
+
+	s32 last_id = -1;
+	u32 index = 0;
+	f64 sum = 0;
+
+	ct_for_each_op(set, [&](s32 id, ct_op& op)
+	{
+		if (id != last_id)
+		{
+			last_id = id;
+			index = 0;
+		}
+
+		if (op.type == ct_button)
+		{
+			set.fast = true;
+		}
+		else if (op.type == ct_count)
+		{
+			set.has_counts = true;
+
+			if (const auto found = saved.find({id, index}); found != saved.end())
+			{
+				op.state = found->second;
+			}
+
+			sum += op.state;
+			index++;
+		}
+	});
+
+	set.saved_counts = sum;
+}
+
+static void ct_save_counts(ct_rules_set& set, const std::string& trp_name)
+{
+	std::string text;
+	s32 last_id = -1;
+	u32 index = 0;
+	f64 sum = 0;
+
+	ct_for_each_op(set, [&](s32 id, ct_op& op)
+	{
+		if (id != last_id)
+		{
+			last_id = id;
+			index = 0;
+		}
+
+		if (op.type == ct_count)
+		{
+			fmt::append(text, "%d %u %d\n", id, index, static_cast<s64>(op.state));
+			sum += op.state;
+			index++;
+		}
+	});
+
+	if (sum == set.saved_counts)
+	{
+		return;
+	}
+
+	const std::string path = ct_counts_path(trp_name);
+
+	if (fs::create_path(fs::get_parent_dir(path)))
+	{
+		if (fs::file out{path, fs::rewrite})
+		{
+			out.write(text.data(), text.size());
+			set.saved_counts = sum;
+		}
+	}
+}
+
 // Must be called with sce_np_trophy_manager::mtx held
 static ct_rules_set& ct_get_rules(const std::string& trp_name, bool reload = false)
 {
@@ -1584,6 +1920,7 @@ static ct_rules_set& ct_get_rules(const std::string& trp_name, bool reload = fal
 
 		// Also done when a savestate skipped sceNpTrophyRegisterContext; merging twice is harmless
 		set.defined_trophies = ct_merge_custom(set, trp_name);
+		ct_load_counts(set, trp_name);
 	}
 
 	return set;
@@ -1743,6 +2080,7 @@ static u32 np_trophy_unlock_impl(ppu_thread& ppu, trophy_context_t* ctxt, const 
 void sceNpTrophy_check_custom_rules(ppu_thread& ppu)
 {
 	static atomic_t<u64> s_next_check = 0;
+	static atomic_t<u64> s_interval = 250'000;
 
 	const u64 now = get_system_time();
 
@@ -1751,7 +2089,10 @@ void sceNpTrophy_check_custom_rules(ppu_thread& ppu)
 		return;
 	}
 
-	s_next_check = now + 250'000;
+	s_next_check = now + s_interval.load();
+
+	// Button rules need to see every frame, everything else is fine at 4x a second
+	bool any_fast = false;
 
 	auto& trophy_manager = g_fxo->get<sce_np_trophy_manager>();
 
@@ -1777,6 +2118,8 @@ void sceNpTrophy_check_custom_rules(ppu_thread& ppu)
 		{
 			continue;
 		}
+
+		any_fast |= rules.fast;
 
 		const s32 count = static_cast<s32>(ctxt->tropusr->GetTrophiesCount());
 
@@ -1876,7 +2219,15 @@ void sceNpTrophy_check_custom_rules(ppu_thread& ppu)
 				out.write(text.data(), text.size());
 			}
 		}
+
+		if (rules.has_counts && now >= rules.next_counts_write)
+		{
+			rules.next_counts_write = now + 5'000'000;
+			ct_save_counts(rules, ctxt->trp_name);
+		}
 	}
+
+	s_interval = any_fast ? 12'000 : 250'000;
 }
 
 // Functions
