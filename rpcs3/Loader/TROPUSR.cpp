@@ -231,6 +231,34 @@ bool TROPUSRLoader::Generate(std::string_view filepath, std::string_view configp
 	return Save(filepath);
 }
 
+bool TROPUSRLoader::SyncWithConfig(std::string_view filepath, std::string_view configpath)
+{
+	const std::vector<TROPUSREntry6> old = m_table6;
+
+	if (!Generate(filepath, configpath))
+	{
+		return false;
+	}
+
+	for (TROPUSREntry6& entry : m_table6)
+	{
+		for (const TROPUSREntry6& before : old)
+		{
+			if (before.trophy_id == entry.trophy_id)
+			{
+				entry.trophy_state = before.trophy_state;
+				entry.unk4 = before.unk4;
+				entry.unk5 = before.unk5;
+				entry.timestamp1 = before.timestamp1;
+				entry.timestamp2 = before.timestamp2;
+				break;
+			}
+		}
+	}
+
+	return Save(filepath);
+}
+
 u32 TROPUSRLoader::GetTrophiesCount() const
 {
 	return ::size32(m_table6);

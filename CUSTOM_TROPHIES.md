@@ -38,6 +38,27 @@ trophies:
   longer block the platinum. The game itself still sees them, so nothing breaks.
 * `trophies` - one entry per trophy id. The trophy is awarded once every condition is true.
 
+## Custom trophies
+
+New trophies are listed under `custom:`. They are added after the game's own trophies, in
+order, every time the game starts; the game's `TROPHY.TRP` is never modified and the progress
+file (`TROPUSR.DAT`) is resized automatically, keeping what was already earned.
+
+```yaml
+game: PPU-becb727cee674b3b8ce10f8457f61b00a60cb20f
+custom:
+  - name: "Pest Control"
+    detail: "Kill 14 enemies in PIXEL!"
+    grade: B                 # B, S or G
+    icon: pest.png           # optional, in trophy_rules/<NPWRxxxxx_00>/; the game icon otherwise
+    when: "[[0xF3F20]+0x24] >= 14"
+```
+
+Only add to the end of the list: a trophy's position decides its number, so removing or
+reordering entries moves earned progress onto the wrong trophies.
+
+The **Create trophy** form in the memory search (tap a result) writes these entries for you.
+
 ## Conditions
 
 `<value> <compare> <value>`, compare being `==  !=  >=  <=  >  <`. Several conditions can be

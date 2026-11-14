@@ -8806,6 +8806,7 @@ extern "C" void *_armsx3_setCustomDriver(void *driverHandle) {
 //                                    went down / stayed the same since last time
 //   list <max>                       current candidates with their live values
 //   reset                            drop the search
+//   info                             "ok <PPU hash of the running game>"
 //   pointer <hex addr>               find fixed places that point at (or just before)
 //                                    an address, directly or through one more pointer.
 //                                    Reply lines are address expressions such as
@@ -8966,6 +8967,11 @@ extern "C" std::string _armsx3_memSearch(std::string_view command) {
     state.type.clear();
     state.clear();
     return "err no game is running";
+  }
+
+  if (args[0] == "info") {
+    // The executable's hash, which a rules file names so it only runs on this game version
+    return "ok " + Emu.GetExecutableHash();
   }
 
   if (args[0] == "pointer") {

@@ -309,6 +309,12 @@ static void show_trophy_notification(const trophy_context_t* ctxt, s32 trophyId)
 //   trophies:
 //     14:
 //       when: "[[0xF3F20]+0x48] >= 50"
+//   custom:                      # optional: new trophies, added after the game's own
+//     - name: "Pest Control"
+//       detail: "Kill 14 enemies"
+//       grade: B                 # B, S or G
+//       icon: pest.png           # in trophy_rules/<NPWRxxxxx_00>/, optional
+//       when: "[[0xF3F20]+0x24] >= 14"
 //
 // Without a rules file nothing here changes any behaviour.
 // ---------------------------------------------------------------------------------------
@@ -356,8 +362,21 @@ struct ct_rule
 	std::string text;
 };
 
+// A trophy the pack adds on top of the game's own set
+struct ct_custom_trophy
+{
+	std::string name;
+	std::string detail;
+	std::string icon;
+	char grade = 'B';
+	bool hidden = false;
+	ct_rule rule; // id is assigned when the trophy is merged in
+};
+
 struct ct_rules_set
 {
+	std::vector<ct_custom_trophy> custom;
+	u32 defined_trophies = 0; // official + custom, 0 if unknown
 	bool loaded = false;
 	bool platinum_checked = false;
 	s32 original_count = -1;
@@ -1018,7 +1037,254 @@ static void ct_load(ct_rules_set& set, const std::string& trp_name)
 		}
 	}
 
-	sceNpTrophy.success("Custom trophy rules: loaded '%s' (%d rules, %d removed)", used_path, set.rules.size(), set.removed.size());
+	if (const YAML::Node node = root["custom"]; node && node.IsSequence())
+	{
+		for (const auto& entry : node)
+		{
+			if (!entry.IsMap())
+			{
+				continue;
+			}
+
+			const YAML::Node& value = entry;
+			ct_custom_trophy trophy{};
+
+			if (const YAML::Node n = value["name"]; n && n.IsScalar())
+			{
+				trophy.name = n.Scalar();
+			}
+
+			if (const YAML::Node n = value["detail"]; n && n.IsScalar())
+			{
+				trophy.detail = n.Scalar();
+			}
+
+			if (const YAML::Node n = value["icon"]; n && n.IsScalar())
+			{
+				trophy.icon = n.Scalar();
+			}
+
+			if (const YAML::Node n = value["grade"]; n && n.IsScalar() && !n.Scalar().empty())
+			{
+				const char grade = n.Scalar()[0];
+				trophy.grade = (grade == 'G' || grade == 'g') ? 'G' : (grade == 'S' || grade == 's') ? 'S' : 'B';
+			}
+
+			if (const YAML::Node n = value["hidden"]; n && n.IsScalar())
+			{
+				trophy.hidden = n.Scalar() == "true" || n.Scalar() == "yes";
+			}
+
+			if (trophy.name.empty())
+			{
+				sceNpTrophy.error("Custom trophy rules: a custom trophy in '%s' has no name, skipping", used_path);
+				continue;
+			}
+
+			bool valid = true;
+
+			if (const YAML::Node when = value["when"]; rules_allowed && when && when.IsScalar())
+			{
+				ct_add_conditions(trophy.rule, when.Scalar(), valid);
+			}
+			else if (rules_allowed && when && when.IsSequence())
+			{
+				for (const auto& item : when)
+				{
+					if (valid && item.IsScalar())
+					{
+						ct_add_conditions(trophy.rule, item.Scalar(), valid);
+					}
+				}
+			}
+
+			if (!valid)
+			{
+				// Keep the trophy, it just cannot be earned until the rule is fixed
+				trophy.rule = {};
+			}
+
+			set.custom.emplace_back(std::move(trophy));
+		}
+	}
+
+	sceNpTrophy.success("Custom trophy rules: loaded '%s' (%d rules, %d removed, %d custom trophies)", used_path, set.rules.size(), set.removed.size(), set.custom.size());
+}
+
+static std::string ct_xml_escape(const std::string& text)
+{
+	std::string out;
+
+	for (const char c : text)
+	{
+		switch (c)
+		{
+		case '&': out += "&amp;"; break;
+		case '<': out += "&lt;"; break;
+		case '>': out += "&gt;"; break;
+		case '"': out += "&quot;"; break;
+		default: out += c; break;
+		}
+	}
+
+	return out;
+}
+
+// Adds the pack's custom trophies to the freshly installed trophy data: the definitions go
+// into the .SFM files, the icons next to the game's own, and their rules get their ids.
+// Returns the total number of trophies now defined (0 if the config could not be read).
+// The game's TROPHY.TRP itself is never modified.
+static u32 ct_merge_custom(ct_rules_set& set, const std::string& trp_name)
+{
+	static constexpr std::string_view s_marker = "<!--custom-trophies-->";
+	static constexpr std::string_view s_end = "</trophyconf>";
+
+	const std::string home = "/dev_hdd0/home/" + Emu.GetUsr();
+	const std::string dir = vfs::get(home + "/trophy/" + trp_name + "/");
+	const std::string icon_dir = vfs::get(home + "/trophy_rules/" + trp_name + "/");
+
+	const auto read_clean = [&](const std::string& path, std::string& text)
+	{
+		fs::file file{path};
+
+		if (!file)
+		{
+			return false;
+		}
+
+		text = file.to_string();
+
+		// Drop anything a previous merge left behind
+		if (const usz mark = text.find(s_marker); mark != umax)
+		{
+			if (const usz end = text.find(s_end, mark); end != umax)
+			{
+				text.erase(mark, end - mark);
+			}
+		}
+
+		return true;
+	};
+
+	std::string conf;
+
+	if (dir.empty() || !read_clean(dir + "TROPCONF.SFM", conf))
+	{
+		return 0;
+	}
+
+	// Official trophies: highest id + 1
+	u32 count = 0;
+
+	for (usz pos = 0; (pos = conf.find("<trophy id=\"", pos)) != umax; pos += 12)
+	{
+		const long id = std::strtol(conf.c_str() + pos + 12, nullptr, 10);
+
+		if (id >= 0 && id < 0x10000)
+		{
+			count = std::max<u32>(count, static_cast<u32>(id) + 1);
+		}
+	}
+
+	if (count == 0 || set.custom.empty())
+	{
+		return count;
+	}
+
+	if (count + set.custom.size() > 128)
+	{
+		sceNpTrophy.error("Custom trophy rules: too many custom trophies (a set can hold 128 in total)");
+		return count;
+	}
+
+	if (set.original_count < 0)
+	{
+		set.original_count = static_cast<s32>(count);
+	}
+
+	std::string blocks{s_marker};
+	blocks += '\n';
+
+	for (usz i = 0; i < set.custom.size(); i++)
+	{
+		ct_custom_trophy& trophy = set.custom[i];
+		const u32 id = count + static_cast<u32>(i);
+
+		fmt::append(blocks, " <trophy id=\"%03u\" hidden=\"%s\" ttype=\"%s\" pid=\"-1\">\n  <name>%s</name>\n  <detail>%s</detail>\n </trophy>\n",
+			id, trophy.hidden ? "yes" : "no", std::string(1, trophy.grade), ct_xml_escape(trophy.name), ct_xml_escape(trophy.detail));
+
+		// Icon: the pack's own if it has one, otherwise the game's icon
+		const std::string dst = dir + fmt::format("TROP%03u.PNG", id);
+		const bool safe_name = !trophy.icon.empty() && trophy.icon.find('/') == umax && trophy.icon.find('\\') == umax && trophy.icon.find("..") == umax;
+
+		if (!safe_name || icon_dir.empty() || !fs::copy_file(icon_dir + trophy.icon, dst, true))
+		{
+			if (!fs::copy_file(dir + "ICON0.PNG", dst, true))
+			{
+				sceNpTrophy.warning("Custom trophy rules: no icon for custom trophy %d", id);
+			}
+		}
+
+		if (!trophy.rule.all.empty())
+		{
+			ct_rule rule = trophy.rule;
+			rule.id = static_cast<s32>(id);
+			sceNpTrophy.notice("Custom trophy rules: custom trophy %d '%s' when %s", id, trophy.name, rule.text);
+			set.rules.emplace_back(std::move(rule));
+		}
+		else
+		{
+			sceNpTrophy.warning("Custom trophy rules: custom trophy %d '%s' has no usable rule, it cannot be earned", id, trophy.name);
+		}
+	}
+
+	// The same definitions go into every config file that was installed
+	std::vector<std::string> names{"TROPCONF.SFM", "TROP.SFM"};
+
+	for (u32 i = 0; i <= 18; i++)
+	{
+		names.emplace_back(fmt::format("TROP_%02d.SFM", i));
+	}
+
+	bool conf_written = false;
+
+	for (const std::string& name : names)
+	{
+		std::string text;
+
+		if (!read_clean(dir + name, text))
+		{
+			continue;
+		}
+
+		const usz end = text.rfind(s_end);
+
+		if (end == umax)
+		{
+			continue;
+		}
+
+		text.insert(end, blocks);
+
+		if (fs::file out{dir + name, fs::rewrite}; out && out.write(text.data(), text.size()) == text.size())
+		{
+			conf_written |= name == "TROPCONF.SFM";
+		}
+		else
+		{
+			sceNpTrophy.error("Custom trophy rules: failed to update %s", name);
+		}
+	}
+
+	if (!conf_written)
+	{
+		// Without the definitions the rules must not run either
+		std::erase_if(set.rules, [&](const ct_rule& rule) { return rule.id >= static_cast<s32>(count); });
+		return count;
+	}
+
+	sceNpTrophy.success("Custom trophy rules: added %d custom trophies after the game's %d", set.custom.size(), count);
+	return count + static_cast<u32>(set.custom.size());
 }
 
 // Must be called with sce_np_trophy_manager::mtx held
@@ -1029,6 +1295,9 @@ static ct_rules_set& ct_get_rules(const std::string& trp_name, bool reload = fal
 	if (reload || !set.loaded)
 	{
 		ct_load(set, trp_name);
+
+		// Also done when a savestate skipped sceNpTrophyRegisterContext; merging twice is harmless
+		set.defined_trophies = ct_merge_custom(set, trp_name);
 	}
 
 	return set;
@@ -1714,10 +1983,24 @@ error_code sceNpTrophyRegisterContext(ppu_thread& ppu, u32 context, u32 handle, 
 	const std::string trophyUsrPath = trophyPath + "/TROPUSR.DAT";
 	const std::string trophyConfPath = trophyPath + "/TROPCONF.SFM";
 
+	// (Re)load the optional custom trophy rules that belong to this trophy set, and add its
+	// custom trophies to the definitions that were just installed
+	const ct_rules_set custom_rules = ct_get_rules(ctxt->trp_name, true);
+	const u32 defined_trophies = custom_rules.defined_trophies;
+
 	ensure(tropusr->Load(trophyUsrPath, trophyConfPath).success);
 
-	// (Re)load the optional custom trophy rules that belong to this trophy set
-	const ct_rules_set custom_rules = ct_get_rules(ctxt->trp_name, true);
+	if (defined_trophies != 0 && tropusr->GetTrophiesCount() != defined_trophies)
+	{
+		// The trophy set grew or shrank (custom trophies were added or removed): rebuild the
+		// progress file for the new set, keeping everything that was already earned
+		sceNpTrophy.warning("sceNpTrophyRegisterContext(): TROPUSR.DAT has %d trophies but %d are defined, resizing", tropusr->GetTrophiesCount(), defined_trophies);
+
+		if (!tropusr->SyncWithConfig(trophyUsrPath, trophyConfPath))
+		{
+			sceNpTrophy.error("sceNpTrophyRegisterContext(): Failed to resize TROPUSR.DAT");
+		}
+	}
 
 	if (g_cfg.net.psn_status == np_psn_status::psn_rpcn)
 	{

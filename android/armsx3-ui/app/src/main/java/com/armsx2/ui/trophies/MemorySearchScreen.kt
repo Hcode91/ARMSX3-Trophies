@@ -3,6 +3,9 @@ package com.armsx2.ui.trophies
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
 import android.widget.Toast
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -37,6 +40,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 
 /**
  * Memory search for custom trophy rules (ARMSX3-Trophies).
@@ -82,7 +86,7 @@ object MemorySearch {
     fun pointerRule(expr: String, fallbackValue: String): String {
         val prefix = if (type.value == "u32") "" else type.value
         val target = value.value.trim().ifEmpty { fallbackValue }
-        return "when: \"$prefix[$expr] >= $target\""
+        return "$prefix[$expr] >= $target"
     }
 
     /** Runs [command], then re-reads the first results. Blocking: call off the main thread. */
@@ -131,11 +135,99 @@ object MemorySearch {
         runCatching { ARMSX3.instance.memSearch(command) }.getOrNull()
             ?: "err this build of the emulator core has no memory search"
 
-    /** The rules-file line for [hit], using the number last searched for as the target. */
+    /** The rule for [hit], using the number last searched for as the target. */
     fun ruleFor(hit: Hit): String {
         val prefix = if (type.value == "u32") "" else type.value
         val target = value.value.trim().ifEmpty { hit.value }
-        return "when: \"$prefix[0x${hit.address}] >= $target\""
+        return "$prefix[0x${hit.address}] >= $target"
+    }
+
+    // ---- "Create trophy" form. Non-null draftRule = the form is open. ----
+    val draftRule = mutableStateOf<String?>(null)
+    val draftName = mutableStateOf("")
+    val draftDetail = mutableStateOf("")
+    val draftGrade = mutableStateOf("B")
+    val draftIcon = mutableStateOf<Uri?>(null)
+    /** Shown after a trophy was written. */
+    val created = mutableStateOf("")
+
+    fun openDraft(rule: String) {
+        draftRule.value = rule
+        draftName.value = ""
+        draftDetail.value = ""
+        draftGrade.value = "B"
+        draftIcon.value = null
+        created.value = ""
+        message.value = ""
+    }
+
+    private fun quote(text: String): String =
+        "\"" + text.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", " ") + "\""
+
+    /**
+     * Appends the drafted trophy to the running game's rules file
+     * (home/<user>/trophy_rules/<NPWRxxxxx_00>.yml, see CUSTOM_TROPHIES.md), creating the file
+     * if needed. The core merges it into the trophy list the next time the game starts.
+     * Blocking: call off the main thread. Returns an error message, or null on success.
+     */
+    fun createTrophy(context: Context): String? {
+        val rule = draftRule.value?.trim().orEmpty()
+        val name = draftName.value.trim()
+        if (name.isEmpty()) return "Give the trophy a name."
+        if (rule.isEmpty()) return "The rule is empty."
+
+        val set = runCatching { ARMSX3.instance.getCurrentTrophyName() }.getOrNull()?.trim().orEmpty()
+        if (set.isEmpty()) return "This game has not set up its trophies yet. Play until it has, then try again."
+        val user = runCatching { ARMSX3.instance.getUser() }.getOrNull()?.takeIf { it.isNotBlank() } ?: "00000001"
+
+        val rulesDir = File(ARMSX3.getHdd0Dir(), "home/$user/trophy_rules")
+        val file = File(rulesDir, "$set.yml")
+
+        return runCatching<String?> {
+            rulesDir.mkdirs()
+
+            var text = if (file.isFile) {
+                file.readText()
+            } else {
+                val info = call("info")
+                val hash = info.removePrefix("ok").trim().takeIf { info.startsWith("ok") && it.startsWith("PPU-") }
+                "# Custom trophies for $set\n" + (if (hash != null) "game: $hash\n" else "")
+            }
+            if (text.isNotEmpty() && !text.endsWith("\n")) text += "\n"
+
+            // The new entry is appended to the end of the file, so `custom:` has to be the last
+            // top-level key (it is in every file this screen writes).
+            val topLevel = text.lines().filter { it.isNotBlank() && !it.startsWith(" ") && !it.startsWith("\t") && !it.startsWith("#") && !it.startsWith("-") }
+            val hasCustom = topLevel.any { it.startsWith("custom:") }
+            if (hasCustom && topLevel.lastOrNull()?.startsWith("custom:") != true) {
+                return@runCatching "In ${file.name}, move the custom: section to the end of the file first."
+            }
+            if (hasCustom && topLevel.last().removePrefix("custom:").substringBefore('#').isNotBlank()) {
+                return@runCatching "In ${file.name}, custom: has to be a list with one trophy per \"- name:\" entry."
+            }
+            if (!hasCustom) text += "custom:\n"
+
+            var iconLine = ""
+            draftIcon.value?.let { uri ->
+                val bitmap = context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
+                if (bitmap != null) {
+                    val iconDir = File(rulesDir, set)
+                    iconDir.mkdirs()
+                    val iconName = "trophy_${System.currentTimeMillis()}.png"
+                    val scaled = Bitmap.createScaledBitmap(bitmap, 240, 240, true)
+                    File(iconDir, iconName).outputStream().use { scaled.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                    iconLine = "    icon: $iconName\n"
+                }
+            }
+
+            text += "  - name: ${quote(name)}\n" +
+                "    detail: ${quote(draftDetail.value.trim())}\n" +
+                "    grade: ${draftGrade.value}\n" +
+                iconLine +
+                "    when: ${quote(rule)}\n"
+            file.writeText(text)
+            null
+        }.getOrElse { "Could not save the trophy: ${it.message}" }
     }
 }
 
@@ -148,11 +240,17 @@ fun MemorySearchScreen(onBack: () -> Unit) {
     val active = count >= 0
 
     val run: (String?) -> Unit = { command -> launchSearch(scope, command) }
-    val copy: (String) -> Unit = { rule ->
+    // Tapping a result opens the "create trophy" form with its rule filled in.
+    val copy: (String) -> Unit = { rule -> MemorySearch.openDraft(rule) }
+    val copyText: (String) -> Unit = { rule ->
+        val line = "when: \"$rule\""
         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-        clipboard?.setPrimaryClip(ClipData.newPlainText("Trophy rule", rule))
-        Toast.makeText(context, "Copied: $rule", Toast.LENGTH_SHORT).show()
+        clipboard?.setPrimaryClip(ClipData.newPlainText("Trophy rule", line))
+        Toast.makeText(context, "Copied: $line", Toast.LENGTH_SHORT).show()
     }
+    val pickIcon = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.GetContent(),
+    ) { uri -> if (uri != null) MemorySearch.draftIcon.value = uri }
 
     // Pick up a search that is still alive in the core from an earlier visit.
     androidx.compose.runtime.LaunchedEffect(Unit) { run(null) }
@@ -170,10 +268,77 @@ fun MemorySearchScreen(onBack: () -> Unit) {
                 leading = { RoundAction("←", "Back", onBack) },
             )
 
+            val draft = MemorySearch.draftRule.value
+            if (draft != null) {
+                Column(
+                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text("New trophy", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface)
+                    OutlinedTextField(
+                        value = MemorySearch.draftName.value,
+                        onValueChange = { MemorySearch.draftName.value = it },
+                        label = { Text("Name") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        value = MemorySearch.draftDetail.value,
+                        onValueChange = { MemorySearch.draftDetail.value = it },
+                        label = { Text("Description") },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        value = draft,
+                        onValueChange = { MemorySearch.draftRule.value = it },
+                        label = { Text("Earned when (change the number at the end to your target)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        GradeButton("B", "Bronze")
+                        GradeButton("S", "Silver")
+                        GradeButton("G", "Gold")
+                    }
+                    OutlinedButton(onClick = { pickIcon.launch("image/*") }, modifier = Modifier.fillMaxWidth()) {
+                        Text(if (MemorySearch.draftIcon.value == null) "Pick an icon (optional)" else "Icon picked - tap to change")
+                    }
+                    Button(
+                        onClick = {
+                            launchWork(scope) {
+                                val error = MemorySearch.createTrophy(context)
+                                if (error == null) {
+                                    MemorySearch.created.value =
+                                        "\"${MemorySearch.draftName.value.trim()}\" saved. Close the game and start it again to see it in the trophy list."
+                                    MemorySearch.draftRule.value = null
+                                    MemorySearch.message.value = ""
+                                } else {
+                                    MemorySearch.message.value = error
+                                }
+                            }
+                        },
+                        enabled = !busy && MemorySearch.draftName.value.isNotBlank(),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Create trophy") }
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        OutlinedButton(onClick = { copyText(draft) }) { Text("Copy rule text") }
+                        OutlinedButton(onClick = { MemorySearch.draftRule.value = null; MemorySearch.message.value = "" }) { Text("Cancel") }
+                    }
+                    val error = MemorySearch.message.value
+                    if (error.isNotEmpty()) {
+                        Text(error, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            } else
             Column(
                 Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
+                val created = MemorySearch.created.value
+                if (created.isNotEmpty()) {
+                    Text(created, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
+                }
+
                 Text(
                     if (!active) {
                         "1. Type a number you can see in the game (coins, lives, score) and search. " +
@@ -182,7 +347,7 @@ fun MemorySearchScreen(onBack: () -> Unit) {
                             "3. Come back here and filter. Repeat until only a few are left."
                     } else {
                         "Go back to the game, change the number, then filter here. " +
-                            "Tap a result to copy a rule line for the trophy rules file."
+                            "Tap a result to make a trophy from it."
                     },
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -305,7 +470,7 @@ fun MemorySearchScreen(onBack: () -> Unit) {
                                     "No pointer found for 0x${hit.address}. A plain address rule may still work; " +
                                         "check it after restarting the game."
                                 } else {
-                                    "Pointer rules for 0x${hit.address} (likeliest first). Tap one to copy. " +
+                                    "Pointer rules for 0x${hit.address} (likeliest first). Tap one to make a trophy from it. " +
                                         "These should keep working after a restart; if one does not, try the next."
                                 },
                                 style = MaterialTheme.typography.bodySmall,
@@ -371,6 +536,15 @@ private fun TypeButton(type: String, label: String) {
         Button(onClick = {}) { Text(label) }
     } else {
         OutlinedButton(onClick = { MemorySearch.type.value = type }) { Text(label) }
+    }
+}
+
+@Composable
+private fun GradeButton(grade: String, label: String) {
+    if (MemorySearch.draftGrade.value == grade) {
+        Button(onClick = {}) { Text(label) }
+    } else {
+        OutlinedButton(onClick = { MemorySearch.draftGrade.value = grade }) { Text(label) }
     }
 }
 
