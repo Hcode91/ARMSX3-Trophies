@@ -90,6 +90,9 @@ android {
     productFlavors {
         create("github") {
             dimension = "distribution"
+            // ARMSX3-Trophies fork: its own id, so it installs next to the official app
+            // (and keeps its own data) instead of clashing with it.
+            applicationId = "com.armsx3.trophies"
         }
 
         create("play") {
