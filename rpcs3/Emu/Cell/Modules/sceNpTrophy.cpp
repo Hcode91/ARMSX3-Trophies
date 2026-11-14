@@ -327,6 +327,9 @@ enum ct_op_type : u8
 	ct_mul,
 	ct_and,
 	ct_deref,
+	ct_delta,  // value minus what it was when first read this session
+	ct_prev,   // value at the previous check
+	ct_trophy, // 1 if that trophy id is unlocked, else 0
 };
 
 struct ct_op
@@ -336,6 +339,10 @@ struct ct_op
 	u8 size = 4;
 	bool is_signed = false;
 	bool is_float = false;
+
+	// Remembered between checks by ct_delta and ct_prev
+	f64 state = 0;
+	bool has_state = false;
 };
 
 enum ct_cmp_type : u8
@@ -353,13 +360,40 @@ struct ct_condition
 	std::vector<ct_op> lhs;
 	std::vector<ct_op> rhs;
 	u8 cmp = ct_eq;
+	u64 hold_us = 0; // "for 60s": has to stay true this long
+
+	// State
+	u64 held_us = 0;
+	f64 last = 0;         // last value of the left side, for progress display
+	bool readable = false;
+};
+
+using ct_alt = std::vector<ct_condition>; // all of these...
+using ct_clause = std::vector<ct_alt>;    // ...for any one alternative ("||")
+
+struct ct_step
+{
+	std::vector<ct_clause> clauses; // every clause has to hold
 };
 
 struct ct_rule
 {
 	s32 id = -1;
-	std::vector<ct_condition> all;
+	std::vector<ct_step> steps; // in order; a plain "when" is a single step
+	ct_step reset;              // optional: sends a sequence back to its first step
 	std::string text;
+
+	// State
+	u32 current = 0;
+	bool has_progress = false; // simple "value >= target" rules can show progress
+	f64 progress_target = 0;
+	s64 progress_shown = -1;
+};
+
+struct ct_eval_ctx
+{
+	const TROPUSRLoader* tropusr = nullptr;
+	u64 dt_us = 0; // time since the previous check (paused time is not counted)
 };
 
 // A trophy the pack adds on top of the game's own set
@@ -377,6 +411,9 @@ struct ct_rules_set
 {
 	std::vector<ct_custom_trophy> custom;
 	u32 defined_trophies = 0; // official + custom, 0 if unknown
+	u64 last_check = 0;
+	u64 next_progress_write = 0;
+	bool progress_dirty = false;
 	bool loaded = false;
 	bool platinum_checked = false;
 	s32 original_count = -1;
@@ -558,6 +595,42 @@ struct ct_parser
 			return true;
 		}
 
+		// delta(x), prev(x), trophy(n)
+		static constexpr std::pair<std::string_view, u8> s_funcs[] =
+		{
+			{"delta", ct_delta},
+			{"prev", ct_prev},
+			{"trophy", ct_trophy},
+		};
+
+		for (const auto& [name, type] : s_funcs)
+		{
+			if (s.substr(pos).starts_with(name))
+			{
+				usz next = pos + name.size();
+
+				while (next < s.size() && (s[next] == ' ' || s[next] == '\t'))
+				{
+					next++;
+				}
+
+				if (next < s.size() && s[next] == '(')
+				{
+					pos = next + 1;
+
+					if (!expr() || !eat(')'))
+					{
+						return false;
+					}
+
+					ct_op func{};
+					func.type = type;
+					out->push_back(func);
+					return true;
+				}
+			}
+		}
+
 		ct_op deref{};
 		deref.type = ct_deref;
 
@@ -705,16 +778,58 @@ static bool ct_parse_condition(std::string_view text, ct_condition& cond)
 
 	parser.out = &cond.rhs;
 
-	return parser.expr() && parser.at_end();
+	if (!parser.expr())
+	{
+		return false;
+	}
+
+	// Optional "for 60s" / "for 2m": the comparison has to stay true that long
+	parser.skip();
+
+	if (const std::string_view tail = parser.s.substr(parser.pos); tail.starts_with("for ") || tail.starts_with("for\t"))
+	{
+		parser.pos += 3;
+		parser.skip();
+
+		std::string number;
+
+		while (parser.pos < parser.s.size() && ((parser.s[parser.pos] >= '0' && parser.s[parser.pos] <= '9') || parser.s[parser.pos] == '.'))
+		{
+			number += parser.s[parser.pos++];
+		}
+
+		char* end = nullptr;
+		const f64 amount = number.empty() ? -1.0 : std::strtod(number.c_str(), &end);
+
+		if (amount < 0 || !end || *end != '\0' || amount > 86400.0)
+		{
+			return false;
+		}
+
+		f64 seconds = amount;
+
+		if (parser.eat('m'))
+		{
+			seconds = parser.eat('s') ? amount / 1000.0 : amount * 60.0;
+		}
+		else
+		{
+			parser.eat('s');
+		}
+
+		cond.hold_us = static_cast<u64>(seconds * 1'000'000.0);
+	}
+
+	return parser.at_end();
 }
 
 // Evaluate against guest memory. Fails (false) if anything points at unmapped memory.
-static bool ct_eval(const std::vector<ct_op>& ops, f64& result)
+static bool ct_eval(std::vector<ct_op>& ops, const ct_eval_ctx& ctx, f64& result)
 {
 	f64 stack[16]{};
 	u32 sp = 0;
 
-	for (const ct_op& op : ops)
+	for (ct_op& op : ops)
 	{
 		switch (op.type)
 		{
@@ -815,6 +930,41 @@ static bool ct_eval(const std::vector<ct_op>& ops, f64& result)
 
 			break;
 		}
+		case ct_delta:
+		case ct_prev:
+		case ct_trophy:
+		{
+			if (sp < 1)
+			{
+				return false;
+			}
+
+			const f64 a = stack[sp - 1];
+
+			if (op.type == ct_delta)
+			{
+				if (!op.has_state)
+				{
+					op.state = a;
+					op.has_state = true;
+				}
+
+				stack[sp - 1] = a - op.state;
+			}
+			else if (op.type == ct_prev)
+			{
+				stack[sp - 1] = op.has_state ? op.state : a;
+				op.state = a;
+				op.has_state = true;
+			}
+			else
+			{
+				const bool unlocked = ctx.tropusr && a >= 0 && a < ctx.tropusr->GetTrophiesCount() && ctx.tropusr->GetTrophyUnlockState(static_cast<u32>(a));
+				stack[sp - 1] = unlocked ? 1 : 0;
+			}
+
+			break;
+		}
 		default:
 		{
 			return false;
@@ -831,25 +981,22 @@ static bool ct_eval(const std::vector<ct_op>& ops, f64& result)
 	return true;
 }
 
-static bool ct_test(const ct_rule& rule)
+static bool ct_check(ct_condition& cond, const ct_eval_ctx& ctx)
 {
-	if (rule.all.empty())
+	f64 a = 0;
+	f64 b = 0;
+
+	// Both sides are always evaluated so that prev() and delta() see every check
+	const bool read_a = ct_eval(cond.lhs, ctx, a);
+	const bool read_b = ct_eval(cond.rhs, ctx, b);
+
+	cond.readable = read_a;
+	cond.last = a;
+
+	bool ok = false;
+
+	if (read_a && read_b)
 	{
-		return false;
-	}
-
-	for (const ct_condition& cond : rule.all)
-	{
-		f64 a = 0;
-		f64 b = 0;
-
-		if (!ct_eval(cond.lhs, a) || !ct_eval(cond.rhs, b))
-		{
-			return false;
-		}
-
-		bool ok = false;
-
 		switch (cond.cmp)
 		{
 		case ct_eq: ok = a == b; break;
@@ -860,14 +1007,73 @@ static bool ct_test(const ct_rule& rule)
 		case ct_lt: ok = a < b; break;
 		default: break;
 		}
-
-		if (!ok)
-		{
-			return false;
-		}
 	}
 
-	return true;
+	if (!ok)
+	{
+		cond.held_us = 0;
+		return false;
+	}
+
+	if (!cond.hold_us)
+	{
+		return true;
+	}
+
+	cond.held_us += ctx.dt_us;
+	return cond.held_us >= cond.hold_us;
+}
+
+static bool ct_check_step(ct_step& step, const ct_eval_ctx& ctx)
+{
+	bool all = !step.clauses.empty();
+
+	for (ct_clause& clause : step.clauses)
+	{
+		bool any = false;
+
+		for (ct_alt& alt : clause)
+		{
+			bool alt_ok = !alt.empty();
+
+			for (ct_condition& cond : alt)
+			{
+				// No early exit, see ct_check
+				if (!ct_check(cond, ctx))
+				{
+					alt_ok = false;
+				}
+			}
+
+			any |= alt_ok;
+		}
+
+		all &= any;
+	}
+
+	return all;
+}
+
+static bool ct_test(ct_rule& rule, const ct_eval_ctx& ctx)
+{
+	if (rule.steps.empty())
+	{
+		return false;
+	}
+
+	if (!rule.reset.clauses.empty() && ct_check_step(rule.reset, ctx))
+	{
+		// Back to the start, and nothing counts while the reset condition holds
+		rule.current = 0;
+		return false;
+	}
+
+	if (rule.current < rule.steps.size() && ct_check_step(rule.steps[rule.current], ctx))
+	{
+		rule.current++;
+	}
+
+	return rule.current >= rule.steps.size();
 }
 
 static bool ct_parse_int(const std::string& text, s32& out)
@@ -890,28 +1096,144 @@ static bool ct_parse_int(const std::string& text, s32& out)
 	return true;
 }
 
-static void ct_add_conditions(ct_rule& rule, const std::string& text, bool& valid)
+// One clause: "a && b || c && d" (and binds tighter than or)
+static void ct_add_clause(ct_step& step, s32 id, const std::string& text, bool& valid)
 {
-	for (const std::string& part : fmt::split(text, {"&&"}))
+	ct_clause clause;
+
+	for (const std::string& alt_text : fmt::split(text, {"||"}))
 	{
-		ct_condition cond{};
+		ct_alt alt;
 
-		if (!ct_parse_condition(part, cond))
+		for (const std::string& part : fmt::split(alt_text, {"&&"}))
 		{
-			sceNpTrophy.error("Custom trophy rules: trophy %d: cannot understand condition '%s'", rule.id, part);
-			valid = false;
-			return;
+			ct_condition cond{};
+
+			if (!ct_parse_condition(part, cond))
+			{
+				sceNpTrophy.error("Custom trophy rules: trophy %d: cannot understand condition '%s'", id, part);
+				valid = false;
+				return;
+			}
+
+			alt.emplace_back(std::move(cond));
 		}
 
-		rule.all.emplace_back(std::move(cond));
-
-		if (!rule.text.empty())
+		if (!alt.empty())
 		{
-			rule.text += " && ";
+			clause.emplace_back(std::move(alt));
 		}
-
-		rule.text += part;
 	}
+
+	if (!clause.empty())
+	{
+		step.clauses.emplace_back(std::move(clause));
+	}
+}
+
+// Reads "when" (one step), "steps" (a sequence) and "reset" from a rule entry.
+// A bare string or list is taken as "when". Returns false if the rule is unusable.
+static bool ct_parse_rule(const YAML::Node& value, ct_rule& rule)
+{
+	bool valid = true;
+
+	const auto add_step = [&](const YAML::Node& node, ct_step& step, std::string& text)
+	{
+		const auto add = [&](const std::string& clause)
+		{
+			ct_add_clause(step, rule.id, clause, valid);
+
+			if (!text.empty())
+			{
+				text += " && ";
+			}
+
+			text += clause.find("||") != umax ? "(" + clause + ")" : clause;
+		};
+
+		if (node.IsScalar())
+		{
+			add(node.Scalar());
+		}
+		else if (node.IsSequence())
+		{
+			for (const auto& item : node)
+			{
+				if (valid && item.IsScalar())
+				{
+					add(item.Scalar());
+				}
+			}
+		}
+	};
+
+	const auto add_whole_step = [&](const YAML::Node& node)
+	{
+		ct_step step;
+		std::string text;
+		add_step(node, step, text);
+
+		if (!step.clauses.empty())
+		{
+			if (!rule.steps.empty())
+			{
+				rule.text += " THEN ";
+			}
+
+			rule.text += text;
+			rule.steps.emplace_back(std::move(step));
+		}
+	};
+
+	if (value.IsMap())
+	{
+		if (const YAML::Node when = value["when"]; when)
+		{
+			add_whole_step(when);
+		}
+
+		if (const YAML::Node steps = value["steps"]; steps && steps.IsSequence())
+		{
+			for (const auto& item : steps)
+			{
+				add_whole_step(item);
+			}
+		}
+
+		if (const YAML::Node reset = value["reset"]; reset)
+		{
+			std::string text;
+			add_step(reset, rule.reset, text);
+
+			if (!text.empty())
+			{
+				rule.text += " (RESET IF " + text + ")";
+			}
+		}
+	}
+	else
+	{
+		add_whole_step(value);
+	}
+
+	if (!valid || rule.steps.empty())
+	{
+		return false;
+	}
+
+	// "value >= 50" on its own can be shown as progress
+	if (rule.steps.size() == 1 && rule.steps[0].clauses.size() == 1 && rule.steps[0].clauses[0].size() == 1 && rule.steps[0].clauses[0][0].size() == 1)
+	{
+		const ct_condition& cond = rule.steps[0].clauses[0][0][0];
+
+		if ((cond.cmp == ct_ge || cond.cmp == ct_gt) && !cond.hold_us && cond.rhs.size() == 1 && cond.rhs[0].type == ct_push && cond.rhs[0].value >= 1)
+		{
+			rule.has_progress = true;
+			rule.progress_target = cond.rhs[0].value;
+		}
+	}
+
+	return true;
 }
 
 static void ct_load(ct_rules_set& set, const std::string& trp_name)
@@ -1008,26 +1330,7 @@ static void ct_load(ct_rules_set& set, const std::string& trp_name)
 				continue;
 			}
 
-			const YAML::Node& value = entry.second;
-			const YAML::Node when = value.IsMap() ? value["when"] : value;
-			bool valid = true;
-
-			if (when && when.IsScalar())
-			{
-				ct_add_conditions(rule, when.Scalar(), valid);
-			}
-			else if (when && when.IsSequence())
-			{
-				for (const auto& item : when)
-				{
-					if (valid && item.IsScalar())
-					{
-						ct_add_conditions(rule, item.Scalar(), valid);
-					}
-				}
-			}
-
-			if (!valid || rule.all.empty() || set.is_removed(rule.id))
+			if (!ct_parse_rule(entry.second, rule) || set.is_removed(rule.id))
 			{
 				continue;
 			}
@@ -1081,24 +1384,7 @@ static void ct_load(ct_rules_set& set, const std::string& trp_name)
 				continue;
 			}
 
-			bool valid = true;
-
-			if (const YAML::Node when = value["when"]; rules_allowed && when && when.IsScalar())
-			{
-				ct_add_conditions(trophy.rule, when.Scalar(), valid);
-			}
-			else if (rules_allowed && when && when.IsSequence())
-			{
-				for (const auto& item : when)
-				{
-					if (valid && item.IsScalar())
-					{
-						ct_add_conditions(trophy.rule, item.Scalar(), valid);
-					}
-				}
-			}
-
-			if (!valid)
+			if (rules_allowed && !ct_parse_rule(value, trophy.rule))
 			{
 				// Keep the trophy, it just cannot be earned until the rule is fixed
 				trophy.rule = {};
@@ -1225,7 +1511,7 @@ static u32 ct_merge_custom(ct_rules_set& set, const std::string& trp_name)
 			}
 		}
 
-		if (!trophy.rule.all.empty())
+		if (!trophy.rule.steps.empty())
 		{
 			ct_rule rule = trophy.rule;
 			rule.id = static_cast<s32>(id);
@@ -1512,9 +1798,7 @@ void sceNpTrophy_check_custom_rules(ppu_thread& ppu)
 				}
 				else
 				{
-					f64 now = 0;
-					const bool readable = !rule.all.empty() && ct_eval(rule.all[0].lhs, now);
-					sceNpTrophy.notice("Custom trophy rules: trophy %d is locked, watching (%s; first value is %s)", rule.id, rule.text, readable ? fmt::format("%d", static_cast<s64>(now)) : std::string("not readable yet"));
+					sceNpTrophy.notice("Custom trophy rules: trophy %d is locked, watching (%s)", rule.id, rule.text);
 				}
 			}
 
@@ -1527,7 +1811,13 @@ void sceNpTrophy_check_custom_rules(ppu_thread& ppu)
 			}
 		}
 
-		for (const ct_rule& rule : rules.rules)
+		ct_eval_ctx eval_ctx{};
+		eval_ctx.tropusr = ctxt->tropusr.get();
+		// A long gap means the game was paused or stalled; that time does not count
+		eval_ctx.dt_us = rules.last_check ? std::min<u64>(now - rules.last_check, 1'000'000) : 0;
+		rules.last_check = now;
+
+		for (ct_rule& rule : rules.rules)
 		{
 			if (rule.id < 0 || rule.id >= count)
 			{
@@ -1539,13 +1829,52 @@ void sceNpTrophy_check_custom_rules(ppu_thread& ppu)
 				continue;
 			}
 
-			if (!ct_test(rule))
+			const bool earned = ct_test(rule, eval_ctx);
+
+			if (rule.has_progress)
+			{
+				const ct_condition& cond = rule.steps[0].clauses[0][0][0];
+				const s64 shown = cond.readable && cond.last >= 0 && cond.last < 9.0e15 ? static_cast<s64>(cond.last) : -1;
+
+				if (shown != rule.progress_shown)
+				{
+					rule.progress_shown = shown;
+					rules.progress_dirty = true;
+				}
+			}
+
+			if (!earned)
 			{
 				continue;
 			}
 
 			sceNpTrophy.success("Custom trophy rules: trophy %d earned (%s)", rule.id, rule.text);
 			np_trophy_unlock_impl(ppu, ctxt, rules, rule.id, true);
+			rules.progress_dirty = true;
+		}
+
+		// Progress of simple counting rules, for the trophy list ("37 / 50")
+		if (rules.progress_dirty && now >= rules.next_progress_write)
+		{
+			rules.progress_dirty = false;
+			rules.next_progress_write = now + 2'000'000;
+
+			std::string text;
+
+			for (const ct_rule& rule : rules.rules)
+			{
+				if (rule.has_progress && rule.progress_shown >= 0 && rule.id >= 0 && rule.id < count && !ctxt->tropusr->GetTrophyUnlockState(rule.id))
+				{
+					fmt::append(text, "%d %d %d\n", rule.id, rule.progress_shown, static_cast<s64>(rule.progress_target));
+				}
+			}
+
+			const std::string path = vfs::get("/dev_hdd0/home/" + Emu.GetUsr() + "/trophy/" + ctxt->trp_name + "/TROPPROG.TXT");
+
+			if (fs::file out{path, fs::rewrite})
+			{
+				out.write(text.data(), text.size());
+			}
 		}
 	}
 }

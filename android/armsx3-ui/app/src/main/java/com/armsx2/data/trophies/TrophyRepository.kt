@@ -186,13 +186,27 @@ object TrophyRepository {
         // Trophies "removed" by the custom trophy rules are hidden here; the core ignores
         // them too (see sceNpTrophy.cpp), so they no longer count towards the totals.
         val removed = removedTrophyIds(dir)
+        // "37 / 50" for trophies with a simple counting rule, written by the core while the
+        // game runs (TROPPROG.TXT: one "id now target" line per trophy).
+        val progress = runCatching {
+            File(dir, "TROPPROG.TXT").takeIf { it.isFile }?.readLines().orEmpty().mapNotNull { line ->
+                val parts = line.trim().split(' ')
+                val id = parts.getOrNull(0)?.toIntOrNull()
+                val now = parts.getOrNull(1)?.toLongOrNull()
+                val target = parts.getOrNull(2)?.toLongOrNull()
+                if (id != null && now != null && target != null && target > 0) id to "${minOf(now, target)} / $target" else null
+            }.toMap()
+        }.getOrDefault(emptyMap())
 
         val trophies = parsed.trophies.filter { it.id !in removed }.map { def ->
             val entry = state[def.id]
             Trophy(
                 id = def.id,
                 name = def.name,
-                description = def.detail,
+                description = progress[def.id]
+                    ?.takeIf { entry?.unlocked != true && !def.hidden }
+                    ?.let { if (def.detail.isBlank()) it else "${def.detail}  ($it)" }
+                    ?: def.detail,
                 // ttype from the XML is what the native overlay uses; the grade duplicated in
                 // TROPUSR table 4 is the fallback for a set with a missing/odd ttype.
                 grade = def.grade.takeIf { it != Grade.Unknown } ?: entry?.grade ?: Grade.Unknown,

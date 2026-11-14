@@ -75,6 +75,37 @@ Reads can be nested to follow pointers: `[[0xF3F20]+0x48]` reads the pointer sto
 `0xF3F20`, adds `0x48` and reads the number there. If any pointer on the way is null or not
 mapped, the condition is simply false.
 
+### More than a plain comparison
+
+* `delta(x)` - how much `x` has changed since the game started this session:
+  `delta([[0xF3F20]+0x24]) >= 50` is "50 kills in one sitting", whatever the save had before.
+* `prev(x)` - the value of `x` at the previous check, for reacting to changes:
+  `[0x1000] - prev([0x1000]) >= 10` (jumped by 10 at once), `[0x1000] == 0 && prev([0x1000]) > 0`
+  (just dropped to zero).
+* `... for 60s` (also `for 2m`, `for 500ms`) after a comparison - it has to stay true that long:
+  `f32[0x2000] > 90 for 60s`. Time spent paused does not count.
+* `||` - either side is enough. `&&` binds tighter: `a && b || c` is "(a and b) or c".
+* `trophy(n)` - 1 if trophy number `n` is unlocked: `trophy(14) == 1 && trophy(15) == 1` makes a
+  trophy for earning a group of others.
+
+### Sequences
+
+```yaml
+  - name: "Flawless"
+    steps:
+      - "[0x3000] == 1"          # boss fight started
+      - "[0x3004] == 0"          # then: boss health reached zero
+    reset: "prev([0x3008]) > [0x3008]"   # lost health: back to the first step
+```
+
+`steps` have to come true one after another. While `reset` is true the trophy goes back to the
+first step. A rule with `when` is simply a single step, and can have a `reset` too.
+
+### Progress
+
+A rule that is just `value >= number` shows its progress ("37 / 50") next to the trophy in the
+trophy list while it is locked.
+
 Rules are checked about four times a second, so they suit values that stay in memory
 (counters, flags, scores), not ones that only exist for a single frame.
 
