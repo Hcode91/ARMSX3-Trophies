@@ -185,7 +185,11 @@ object TrophyRepository {
 
         // Trophies "removed" by the custom trophy rules are hidden here; the core ignores
         // them too (see sceNpTrophy.cpp), so they no longer count towards the totals.
-        val removed = removedTrophyIds(dir)
+        // ...plus what the core itself reported as hidden the last time the game ran
+        // (TROPHIDE.TXT: one id per line; includes deleted custom trophies).
+        val removed = removedTrophyIds(dir) + runCatching {
+            File(dir, "TROPHIDE.TXT").takeIf { it.isFile }?.readLines().orEmpty().mapNotNull { it.trim().toIntOrNull() }
+        }.getOrDefault(emptyList())
         // "37 / 50" for trophies with a simple counting rule, written by the core while the
         // game runs (TROPPROG.TXT: one "id now target" line per trophy).
         val progress = runCatching {

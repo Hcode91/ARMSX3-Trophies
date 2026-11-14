@@ -242,76 +242,258 @@ object MemorySearch {
         draftIcon.value = null
         created.value = ""
         message.value = ""
+        editing.value = null
     }
 
     private fun quote(text: String): String =
         "\"" + text.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", " ") + "\""
 
+    // ---- The running game's pack: trophy_rules/<set>.yml plus its icon folder. ----
+
+    /** One entry of the file's `custom:` list, kept as its raw lines so anything this screen
+     *  does not understand (steps, reset, comments) survives an edit untouched. */
+    class CustomEntry(val lines: MutableList<String>) {
+        private fun isField(line: String) = line.length - line.trimStart().length <= 4
+        private fun keyOf(line: String) = line.trim().removePrefix("-").trim().substringBefore(':').trim()
+
+        fun get(key: String): String? {
+            val line = lines.firstOrNull { isField(it) && keyOf(it) == key } ?: return null
+            val raw = line.substringAfter(':').trim()
+            return if (raw.length >= 2 && raw.startsWith("\"") && raw.endsWith("\"")) {
+                raw.substring(1, raw.length - 1).replace("\\\"", "\"").replace("\\\\", "\\")
+            } else {
+                raw.substringBefore(" #").trim()
+            }
+        }
+
+        fun set(key: String, value: String) {
+            val at = lines.indexOfFirst { isField(it) && keyOf(it) == key }
+            val line = (if (at == 0) "  - " else "    ") + "$key: $value"
+            if (at >= 0) lines[at] = line else lines.add(line)
+        }
+
+        val deleted: Boolean get() = get("deleted") == "true"
+        val name: String get() = get("name").orEmpty()
+    }
+
+    private class Pack(val file: File, val header: MutableList<String>, val entries: MutableList<CustomEntry>)
+
+    /** (index in the file, entry) of every custom trophy that is not deleted. */
+    val customList = mutableStateOf<List<Pair<Int, CustomEntry>>>(emptyList())
+    /** Index of the entry the form is editing, or null when it is creating a new one. */
+    val editing = mutableStateOf<Int?>(null)
+
+    private fun rulesDir(): File {
+        val user = runCatching { ARMSX3.instance.getUser() }.getOrNull()?.takeIf { it.isNotBlank() } ?: "00000001"
+        return File(ARMSX3.getHdd0Dir(), "home/$user/trophy_rules")
+    }
+
+    private fun currentSet(): String =
+        runCatching { ARMSX3.instance.getCurrentTrophyName() }.getOrNull()?.trim().orEmpty()
+
+    /** Reads the running game's pack. Throws with a readable message if the file has a shape
+     *  this screen cannot edit safely. */
+    private fun readPack(): Pack? {
+        val set = currentSet()
+        if (set.isEmpty()) return null
+        val file = File(rulesDir(), "$set.yml")
+
+        if (!file.isFile) {
+            val info = call("info")
+            val hash = info.removePrefix("ok").trim().takeIf { info.startsWith("ok") && it.startsWith("PPU-") }
+            val header = mutableListOf("# Custom trophies for $set")
+            if (hash != null) header += "game: $hash"
+            header += "custom:"
+            return Pack(file, header, mutableListOf())
+        }
+
+        val lines = file.readLines()
+        val at = lines.indexOfFirst { it.startsWith("custom:") }
+        if (at < 0) {
+            val header = lines.toMutableList()
+            while (header.isNotEmpty() && header.last().isBlank()) header.removeAt(header.size - 1)
+            header += "custom:"
+            return Pack(file, header, mutableListOf())
+        }
+        if (lines[at].removePrefix("custom:").substringBefore('#').isNotBlank()) {
+            throw IllegalStateException("In ${file.name}, custom: has to be a list with one trophy per \"- name:\" entry.")
+        }
+
+        val entries = mutableListOf<CustomEntry>()
+        for (line in lines.drop(at + 1)) {
+            if (line.isBlank()) continue
+            val indented = line.startsWith(" ") || line.startsWith("\t")
+            if (!indented && !line.startsWith("-") && !line.startsWith("#")) {
+                throw IllegalStateException("In ${file.name}, move the custom: section to the end of the file first.")
+            }
+            if (line.trimStart().startsWith("- ") && line.length - line.trimStart().length <= 2) {
+                entries += CustomEntry(mutableListOf(line))
+            } else {
+                entries.lastOrNull()?.lines?.add(line)
+            }
+        }
+        return Pack(file, lines.take(at + 1).toMutableList(), entries)
+    }
+
+    private fun writePack(pack: Pack) {
+        pack.file.parentFile?.mkdirs()
+        pack.file.writeText((pack.header + pack.entries.flatMap { it.lines }).joinToString("\n") + "\n")
+    }
+
+    /** Re-reads the list of this game's custom trophies. Blocking. */
+    fun refreshCustom() {
+        customList.value = runCatching {
+            readPack()?.entries.orEmpty().withIndex().filter { !it.value.deleted }.map { it.index to it.value }
+        }.getOrDefault(emptyList())
+    }
+
+    /** Opens the form on an existing custom trophy. */
+    fun openEdit(index: Int, entry: CustomEntry) {
+        openDraft(entry.get("when").orEmpty())
+        editing.value = index
+        draftName.value = entry.name
+        draftDetail.value = entry.get("detail").orEmpty()
+        draftGrade.value = entry.get("grade")?.take(1)?.uppercase()?.takeIf { it in listOf("B", "S", "G") } ?: "B"
+    }
+
     /**
-     * Appends the drafted trophy to the running game's rules file
-     * (home/<user>/trophy_rules/<NPWRxxxxx_00>.yml, see CUSTOM_TROPHIES.md), creating the file
-     * if needed. The core merges it into the trophy list the next time the game starts.
+     * Deletes a custom trophy. It keeps its place in the file, marked `deleted: true`: a custom
+     * trophy's number is its position, so truly removing it would move every later trophy's
+     * earned state onto the wrong trophy. The core hides it and never awards it.
+     * Blocking. Returns an error message, or null.
+     */
+    fun deleteCustom(index: Int): String? = runCatching<String?> {
+        val pack = readPack() ?: return@runCatching "No game is running."
+        val entry = pack.entries.getOrNull(index) ?: return@runCatching "That trophy is no longer in the file."
+        entry.set("deleted", "true")
+        writePack(pack)
+        refreshCustom()
+        null
+    }.getOrElse { it.message ?: "Could not delete the trophy." }
+
+    /**
+     * Saves the form: a new entry at the end of the running game's `custom:` list, or the edited
+     * fields of an existing one. The core merges the list into the trophy list the next time
+     * the game starts (see CUSTOM_TROPHIES.md).
      * Blocking: call off the main thread. Returns an error message, or null on success.
      */
     fun createTrophy(context: Context): String? {
         val rule = draftRule.value?.trim().orEmpty()
         val name = draftName.value.trim()
+        val editIndex = editing.value
         if (name.isEmpty()) return "Give the trophy a name."
-        if (rule.isEmpty()) return "The rule is empty."
+        if (rule.isEmpty() && editIndex == null) return "The rule is empty."
 
-        val set = runCatching { ARMSX3.instance.getCurrentTrophyName() }.getOrNull()?.trim().orEmpty()
+        val set = currentSet()
         if (set.isEmpty()) return "This game has not set up its trophies yet. Play until it has, then try again."
-        val user = runCatching { ARMSX3.instance.getUser() }.getOrNull()?.takeIf { it.isNotBlank() } ?: "00000001"
-
-        val rulesDir = File(ARMSX3.getHdd0Dir(), "home/$user/trophy_rules")
-        val file = File(rulesDir, "$set.yml")
 
         return runCatching<String?> {
-            rulesDir.mkdirs()
+            val pack = readPack() ?: return@runCatching "No game is running."
 
-            var text = if (file.isFile) {
-                file.readText()
-            } else {
-                val info = call("info")
-                val hash = info.removePrefix("ok").trim().takeIf { info.startsWith("ok") && it.startsWith("PPU-") }
-                "# Custom trophies for $set\n" + (if (hash != null) "game: $hash\n" else "")
-            }
-            if (text.isNotEmpty() && !text.endsWith("\n")) text += "\n"
-
-            // The new entry is appended to the end of the file, so `custom:` has to be the last
-            // top-level key (it is in every file this screen writes).
-            val topLevel = text.lines().filter { it.isNotBlank() && !it.startsWith(" ") && !it.startsWith("\t") && !it.startsWith("#") && !it.startsWith("-") }
-            val hasCustom = topLevel.any { it.startsWith("custom:") }
-            if (hasCustom && topLevel.lastOrNull()?.startsWith("custom:") != true) {
-                return@runCatching "In ${file.name}, move the custom: section to the end of the file first."
-            }
-            if (hasCustom && topLevel.last().removePrefix("custom:").substringBefore('#').isNotBlank()) {
-                return@runCatching "In ${file.name}, custom: has to be a list with one trophy per \"- name:\" entry."
-            }
-            if (!hasCustom) text += "custom:\n"
-
-            var iconLine = ""
+            var iconName: String? = null
             draftIcon.value?.let { uri ->
                 val bitmap = context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
                 if (bitmap != null) {
-                    val iconDir = File(rulesDir, set)
+                    val iconDir = File(rulesDir(), set)
                     iconDir.mkdirs()
-                    val iconName = "trophy_${System.currentTimeMillis()}.png"
+                    iconName = "trophy_${System.currentTimeMillis()}.png"
                     val scaled = Bitmap.createScaledBitmap(bitmap, 240, 240, true)
-                    File(iconDir, iconName).outputStream().use { scaled.compress(Bitmap.CompressFormat.PNG, 100, it) }
-                    iconLine = "    icon: $iconName\n"
+                    File(iconDir, iconName!!).outputStream().use { scaled.compress(Bitmap.CompressFormat.PNG, 100, it) }
                 }
             }
 
-            text += "  - name: ${quote(name)}\n" +
-                "    detail: ${quote(draftDetail.value.trim())}\n" +
-                "    grade: ${draftGrade.value}\n" +
-                iconLine +
-                "    when: ${quote(rule)}\n"
-            file.writeText(text)
+            val entry = if (editIndex != null) {
+                pack.entries.getOrNull(editIndex) ?: return@runCatching "That trophy is no longer in the file."
+            } else {
+                CustomEntry(mutableListOf("  - name: ${quote(name)}")).also { pack.entries += it }
+            }
+
+            entry.set("name", quote(name))
+            entry.set("detail", quote(draftDetail.value.trim()))
+            entry.set("grade", draftGrade.value)
+            iconName?.let { entry.set("icon", it) }
+            // An empty rule box on an edit leaves the existing rule (which may be a sequence
+            // this form cannot show) exactly as it is.
+            if (rule.isNotEmpty()) entry.set("when", quote(rule))
+
+            writePack(pack)
+            editing.value = null
+            refreshCustom()
             null
-        }.getOrElse { "Could not save the trophy: ${it.message}" }
+        }.getOrElse { it.message ?: "Could not save the trophy." }
     }
+
+    /** Writes the running game's pack (rules file + icons) as a zip to [target]. Blocking. */
+    fun exportPack(context: Context, target: Uri): String = runCatching {
+        val set = currentSet()
+        if (set.isEmpty()) return@runCatching "No game is running."
+        val yml = File(rulesDir(), "$set.yml")
+        if (!yml.isFile) return@runCatching "This game has no custom trophies yet."
+        val out = context.contentResolver.openOutputStream(target) ?: return@runCatching "Could not write to that location."
+        java.util.zip.ZipOutputStream(out).use { zip ->
+            zip.putNextEntry(java.util.zip.ZipEntry("$set.yml"))
+            zip.write(yml.readBytes())
+            zip.closeEntry()
+            File(rulesDir(), set).listFiles().orEmpty()
+                .filter { it.isFile && it.name.endsWith(".png", ignoreCase = true) }
+                .forEach { icon ->
+                    zip.putNextEntry(java.util.zip.ZipEntry("$set/${icon.name}"))
+                    zip.write(icon.readBytes())
+                    zip.closeEntry()
+                }
+        }
+        "Pack exported."
+    }.getOrElse { "Could not export the pack: ${it.message}" }
+
+    /**
+     * Installs a pack zip made by [exportPack]. Only a `<NPWRxxxxx_00>.yml` and PNGs in the
+     * matching folder are taken, so a zip cannot write anywhere else. An existing rules file
+     * for that game is kept as `.bak`. Blocking.
+     */
+    fun importPack(context: Context, source: Uri): String = runCatching {
+        val ymlName = Regex("^(NPWR\\d{5}_\\d{2})\\.yml$")
+        val iconName = Regex("^(NPWR\\d{5}_\\d{2})/([A-Za-z0-9_.-]+\\.(?:png|PNG))$")
+        val limit = 5 * 1024 * 1024
+        val dir = rulesDir()
+        var installed: String? = null
+        var icons = 0
+
+        val input = context.contentResolver.openInputStream(source) ?: return@runCatching "Could not read that file."
+        java.util.zip.ZipInputStream(input).use { zip ->
+            while (true) {
+                val entry = zip.nextEntry ?: break
+                val name = entry.name.replace('\\', '/')
+                val yml = ymlName.find(name)
+                val icon = iconName.find(name)
+                if (entry.isDirectory || (yml == null && icon == null)) continue
+
+                val bytes = java.io.ByteArrayOutputStream()
+                val buffer = ByteArray(65536)
+                while (true) {
+                    val read = zip.read(buffer)
+                    if (read < 0) break
+                    bytes.write(buffer, 0, read)
+                    if (bytes.size() > limit) return@runCatching "That pack has a file that is too large."
+                }
+
+                if (yml != null) {
+                    dir.mkdirs()
+                    val target = File(dir, "${yml.groupValues[1]}.yml")
+                    if (target.isFile) target.copyTo(File(dir, "${target.name}.bak"), overwrite = true)
+                    target.writeBytes(bytes.toByteArray())
+                    installed = yml.groupValues[1]
+                } else if (icon != null && ".." !in icon.groupValues[2]) {
+                    val iconDir = File(dir, icon.groupValues[1])
+                    iconDir.mkdirs()
+                    File(iconDir, icon.groupValues[2]).writeBytes(bytes.toByteArray())
+                    icons++
+                }
+            }
+        }
+
+        if (installed == null) "That zip is not a trophy pack."
+        else "Imported the pack for $installed ($icons icons). Start that game (again) to see its trophies."
+    }.getOrElse { "Could not import the pack: ${it.message}" }
 }
 
 @Composable
@@ -334,6 +516,12 @@ fun MemorySearchScreen(onBack: () -> Unit) {
     val pickIcon = androidx.activity.compose.rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.GetContent(),
     ) { uri -> if (uri != null) MemorySearch.draftIcon.value = uri }
+    val exportPack = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.CreateDocument("application/zip"),
+    ) { uri -> if (uri != null) launchWork(scope) { MemorySearch.created.value = MemorySearch.exportPack(context, uri) } }
+    val importPack = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.GetContent(),
+    ) { uri -> if (uri != null) launchWork(scope) { MemorySearch.created.value = MemorySearch.importPack(context, uri); MemorySearch.refreshCustom() } }
 
     // Pick up a search that is still alive in the core from an earlier visit.
     androidx.compose.runtime.LaunchedEffect(Unit) { run(null) }
@@ -341,6 +529,7 @@ fun MemorySearchScreen(onBack: () -> Unit) {
         withContext(Dispatchers.IO) {
             MemorySearch.loadWatches()
             MemorySearch.pollWatches()
+            MemorySearch.refreshCustom()
         }
     }
 
@@ -363,7 +552,7 @@ fun MemorySearchScreen(onBack: () -> Unit) {
                     Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    Text("New trophy", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface)
+                    Text(if (MemorySearch.editing.value != null) "Edit trophy" else "New trophy", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface)
                     OutlinedTextField(
                         value = MemorySearch.draftName.value,
                         onValueChange = { MemorySearch.draftName.value = it },
@@ -398,7 +587,7 @@ fun MemorySearchScreen(onBack: () -> Unit) {
                                 val error = MemorySearch.createTrophy(context)
                                 if (error == null) {
                                     MemorySearch.created.value =
-                                        "\"${MemorySearch.draftName.value.trim()}\" saved. Close the game and start it again to see it in the trophy list."
+                                        "\"${MemorySearch.draftName.value.trim()}\" saved. Close the game and start it again to see the change in the trophy list."
                                     MemorySearch.draftRule.value = null
                                     MemorySearch.message.value = ""
                                 } else {
@@ -408,7 +597,7 @@ fun MemorySearchScreen(onBack: () -> Unit) {
                         },
                         enabled = !busy && MemorySearch.draftName.value.isNotBlank(),
                         modifier = Modifier.fillMaxWidth(),
-                    ) { Text("Create trophy") }
+                    ) { Text(if (MemorySearch.editing.value != null) "Save changes" else "Create trophy") }
                     OutlinedButton(
                         onClick = {
                             launchWork(scope) { MemorySearch.addWatch(MemorySearch.exprOf(draft)) }
@@ -514,6 +703,47 @@ fun MemorySearchScreen(onBack: () -> Unit) {
                         OutlinedButton(onClick = { run(null) }, enabled = !busy) { Text("Refresh values") }
                         OutlinedButton(onClick = { run("reset") }, enabled = !busy) { Text("Start over") }
                     }
+                }
+
+                // This game's custom trophies: edit, delete, export, import
+                val custom = MemorySearch.customList.value
+                if (custom.isNotEmpty()) {
+                    Text(
+                        "This game's custom trophies (changes show after restarting the game):",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    custom.forEach { (index, entry) ->
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Row(
+                                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                            ) {
+                                Text(entry.name, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f))
+                                OutlinedButton(onClick = { MemorySearch.openEdit(index, entry) }) { Text("Edit") }
+                                OutlinedButton(
+                                    onClick = {
+                                        launchWork(scope) {
+                                            MemorySearch.deleteCustom(index)?.let { MemorySearch.message.value = it }
+                                        }
+                                    },
+                                    enabled = !busy,
+                                ) { Text("Delete") }
+                            }
+                        }
+                    }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedButton(
+                        onClick = { exportPack.launch("custom-trophies.zip") },
+                        enabled = !busy && custom.isNotEmpty(),
+                    ) { Text("Export pack") }
+                    OutlinedButton(onClick = { importPack.launch("*/*") }, enabled = !busy) { Text("Import pack") }
                 }
 
                 // Watch list + the over-the-game overlay

@@ -54,10 +54,13 @@ custom:
     when: "[[0xF3F20]+0x24] >= 14"
 ```
 
-Only add to the end of the list: a trophy's position decides its number, so removing or
-reordering entries moves earned progress onto the wrong trophies.
+A custom trophy's number is its position in the list, so never remove or reorder entries by
+hand: that would move earned progress onto the wrong trophies. To get rid of one, add
+`deleted: true` to it. It keeps its place, but is hidden and can no longer be earned.
 
-The **Create trophy** form in the memory search (tap a result) writes these entries for you.
+The memory search screen does all of this for you: **Create trophy** (tap a result), a list of
+the game's custom trophies with **Edit** and **Delete**, and **Export pack** / **Import pack**,
+which save or install the rules file together with its icons as one zip.
 
 ## Conditions
 

@@ -411,6 +411,7 @@ struct ct_custom_trophy
 	std::string icon;
 	char grade = 'B';
 	bool hidden = false;
+	bool deleted = false; // keeps its place in the list (so later trophies keep their numbers) but is hidden and cannot be earned
 	ct_rule rule; // id is assigned when the trophy is merged in
 };
 
@@ -1576,13 +1577,27 @@ static void ct_load(ct_rules_set& set, const std::string& trp_name)
 				trophy.hidden = n.Scalar() == "true" || n.Scalar() == "yes";
 			}
 
+			if (const YAML::Node n = value["deleted"]; n && n.IsScalar())
+			{
+				trophy.deleted = n.Scalar() == "true" || n.Scalar() == "yes";
+			}
+
+			if (trophy.deleted && trophy.name.empty())
+			{
+				trophy.name = "Removed trophy";
+			}
+
 			if (trophy.name.empty())
 			{
 				sceNpTrophy.error("Custom trophy rules: a custom trophy in '%s' has no name, skipping", used_path);
 				continue;
 			}
 
-			if (rules_allowed && !ct_parse_rule(value, trophy.rule))
+			if (trophy.deleted)
+			{
+				// No rule: it only holds its place
+			}
+			else if (rules_allowed && !ct_parse_rule(value, trophy.rule))
 			{
 				// Keep the trophy, it just cannot be earned until the rule is fixed
 				trophy.rule = {};
@@ -1709,7 +1724,11 @@ static u32 ct_merge_custom(ct_rules_set& set, const std::string& trp_name)
 			}
 		}
 
-		if (!trophy.rule.steps.empty())
+		if (trophy.deleted)
+		{
+			set.removed.insert(id);
+		}
+		else if (!trophy.rule.steps.empty())
 		{
 			ct_rule rule = trophy.rule;
 			rule.id = static_cast<s32>(id);
@@ -1769,6 +1788,29 @@ static u32 ct_merge_custom(ct_rules_set& set, const std::string& trp_name)
 
 	sceNpTrophy.success("Custom trophy rules: added %d custom trophies after the game's %d", set.custom.size(), count);
 	return count + static_cast<u32>(set.custom.size());
+}
+
+// Tells the trophy list (which reads the trophy folder directly) which ids to leave out
+static void ct_write_hidden(const ct_rules_set& set, const std::string& trp_name)
+{
+	const std::string dir = vfs::get("/dev_hdd0/home/" + Emu.GetUsr() + "/trophy/" + trp_name + "/");
+
+	if (dir.empty() || set.removed.empty())
+	{
+		return;
+	}
+
+	std::string text;
+
+	for (const u32 id : set.removed)
+	{
+		fmt::append(text, "%u\n", id);
+	}
+
+	if (fs::file out{dir + "TROPHIDE.TXT", fs::rewrite})
+	{
+		out.write(text.data(), text.size());
+	}
 }
 
 // For the memory search's watch list: the current value of an expression such as
@@ -1947,6 +1989,7 @@ static ct_rules_set& ct_get_rules(const std::string& trp_name, bool reload = fal
 
 		// Also done when a savestate skipped sceNpTrophyRegisterContext; merging twice is harmless
 		set.defined_trophies = ct_merge_custom(set, trp_name);
+		ct_write_hidden(set, trp_name);
 		ct_load_counts(set, trp_name);
 	}
 
