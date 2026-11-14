@@ -249,7 +249,7 @@ u32 TROPUSRLoader::GetUnlockedTrophiesCount() const
 	return count;
 }
 
-u32 TROPUSRLoader::GetUnlockedPlatinumID(u32 trophy_id, const std::string& config_path)
+u32 TROPUSRLoader::GetUnlockedPlatinumID(u32 trophy_id, const std::string& config_path, const std::set<u32>* ignored_ids)
 {
 	constexpr u32 invalid_trophy_id = -1; // SCE_NP_TROPHY_INVALID_TROPHY_ID;
 
@@ -319,6 +319,12 @@ u32 TROPUSRLoader::GetUnlockedPlatinumID(u32 trophy_id, const std::string& confi
 	// The platinum trophy stays locked if any relevant trophy is still locked
 	for (usz i = 0; i < trophy_count; i++)
 	{
+		// Trophies removed by the custom trophy rules do not block the platinum
+		if (ignored_ids && ignored_ids->count(static_cast<u32>(i)))
+		{
+			continue;
+		}
+
 		if (m_table4[i].trophy_pid == pid && !m_table6[i].trophy_state)
 		{
 			return invalid_trophy_id;

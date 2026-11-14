@@ -2,6 +2,7 @@
 #include "stdafx.h"
 #include "Utilities/rXml.h"
 #include "Utilities/File.h"
+#include <set>
 
 struct TROPUSRHeader
 {
@@ -101,7 +102,7 @@ public:
 	[[nodiscard]] u32 GetTrophiesCount() const;
 	[[nodiscard]] u32 GetUnlockedTrophiesCount() const;
 
-	[[nodiscard]] u32 GetUnlockedPlatinumID(u32 trophy_id, const std::string& config_path);
+	[[nodiscard]] u32 GetUnlockedPlatinumID(u32 trophy_id, const std::string& config_path, const std::set<u32>* ignored_ids = nullptr);
 
 	[[nodiscard]] u32 GetTrophyGrade(u32 id) const;
 	[[nodiscard]] u32 GetTrophyUnlockState(u32 id) const;
