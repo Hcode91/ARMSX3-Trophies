@@ -76,3 +76,21 @@ The addresses are call sites, innermost first. Looking at that code in the decry
 shows which values the game checks before awarding the trophy, which is the starting point
 for a new rule (e.g. the same counter with a different target). It also fires for trophies
 that are already unlocked, as long as the game still asks for them.
+
+## Memory search
+
+In-game menu → Trophies → **Memory search (custom trophies)**. It finds the address of a
+number you can see in the game:
+
+1. Type the number as it is right now (say 12 coins) and search.
+2. Go back to the game and change it (13 coins).
+3. Come back and filter: "it is now this number", "went up", "went down", "changed" or
+   "stayed the same". Repeat until only a few addresses are left.
+4. Tap a result to copy a rule line such as `when: "[0x1A2B3C] >= 13"` for the rules file.
+
+Number types: whole number (`u32`, the usual one), small (`u16`), tiny (`u8`) and decimal
+(`f32`, for things like health bars and timers).
+
+An address found this way is a plain, fixed address. Many games keep their data at the same
+place every run, but some move it; if a rule stops working after restarting the game, that
+value needs a pointer rule (`[[base]+offset]`) instead, which the search cannot find yet.

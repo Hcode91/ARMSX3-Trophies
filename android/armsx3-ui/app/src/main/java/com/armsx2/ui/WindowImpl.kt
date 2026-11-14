@@ -32,6 +32,8 @@ enum class InGameScreen {
     Settings, CoreSettings, Achievements, Controls, Skins, Textures, SaveState, LoadState,
     // PS3 trophies for the RUNNING title (the library's Trophies screen, scoped).
     Trophies,
+    // Memory search for custom trophy rules (ARMSX3-Trophies).
+    MemorySearch,
     // All Settings' Hotkeys page, from the quick menu's Controller tab.
     Hotkeys,
 }
@@ -228,6 +230,7 @@ object WindowImpl {
                                 key = com.armsx2.ui.emulation.InGameTrophiesVmKey,
                             ),
                         )
+                        InGameScreen.MemorySearch -> com.armsx2.ui.trophies.MemorySearchScreen(onBack = dismiss)
                     }
                 }
             }

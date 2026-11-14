@@ -183,6 +183,7 @@ struct CoreApi {
   int (*patchesImport)(std::string_view content);
   int (*patchesWrite)(std::string_view file, std::string_view content);
   std::string (*patchesList)(std::string_view serial);
+  std::string (*memSearch)(std::string_view command);
   std::string (*probeDiscInfo)(std::string_view isoPath, std::string_view iconOut);
   bool (*xmbDiscMedia)(std::string_view isoPath, std::string_view outDir);
   int (*changeDisc)(std::string_view path);
@@ -383,6 +384,7 @@ struct CoreLibrary : CoreApi {
     result.patchesImport = reinterpret_cast<decltype(patchesImport)>(dlsym(handle, "_armsx3_patchesImport"));
     result.patchesWrite = reinterpret_cast<decltype(patchesWrite)>(dlsym(handle, "_armsx3_patchesWrite"));
     result.patchesList = reinterpret_cast<decltype(patchesList)>(dlsym(handle, "_armsx3_patchesList"));
+    result.memSearch = reinterpret_cast<decltype(memSearch)>(dlsym(handle, "_armsx3_memSearch"));
     result.probeDiscInfo = reinterpret_cast<decltype(probeDiscInfo)>(dlsym(handle, "_armsx3_probeDiscInfo"));
     result.xmbDiscMedia = reinterpret_cast<decltype(xmbDiscMedia)>(dlsym(handle, "_armsx3_xmbDiscMedia"));
     result.changeDisc = reinterpret_cast<decltype(changeDisc)>(dlsym(handle, "_armsx3_changeDisc"));
@@ -1841,6 +1843,17 @@ Java_com_armsx3_core_ARMSX3_patchesList(JNIEnv *env, jobject, jstring jserial) {
   }
 
   return wrap(env, coreLib.patchesList(unwrap(env, jserial)));
+}
+
+// Memory search for custom trophy rules (ARMSX3-Trophies). One text command in, text out;
+// see _armsx3_memSearch in armsx3-core.cpp for the commands.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_armsx3_core_ARMSX3_memSearch(JNIEnv *env, jobject, jstring jcommand) {
+  if (coreLib.memSearch == nullptr) {
+    return wrap(env, "err the emulator core is not loaded");
+  }
+
+  return wrap(env, coreLib.memSearch(unwrap(env, jcommand)));
 }
 
 extern "C" JNIEXPORT jboolean JNICALL

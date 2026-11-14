@@ -8789,3 +8789,295 @@ extern "C" void *_armsx3_setCustomDriver(void *driverHandle) {
 }
 
 #pragma GCC diagnostic pop
+
+// ---------------------------------------------------------------------------
+// Memory search (ARMSX3-Trophies)
+//
+// A small "cheat search" over guest memory, for finding the values that custom
+// trophy rules watch (see CUSTOM_TROPHIES.md). One text command in, text out, so
+// the JNI bridge stays a single function:
+//
+//   new <u8|u16|u32|f32> <value>     start a search for an exact value
+//   filter eq <value>                keep candidates that now equal <value>
+//   filter <ne|gt|lt|same> [-]       keep candidates that changed / went up /
+//                                    went down / stayed the same since last time
+//   list <max>                       current candidates with their live values
+//   reset                            drop the search
+//
+// Reply: "ok <count> <truncated 0|1> <type>" then, for list, "<hex addr> <value>"
+// lines; or "err <message>".
+//
+// Only aligned addresses are considered, and values are big-endian like the PS3.
+// ---------------------------------------------------------------------------
+namespace {
+struct MemSearchState {
+  std::mutex mtx;
+  std::string type;            // empty = no search
+  u32 size = 4;
+  bool is_float = false;
+  bool truncated = false;
+  std::vector<std::pair<u32, u32>> hits; // address, raw value at the last step
+};
+
+MemSearchState g_mem_search;
+
+constexpr usz mem_search_max_hits = 4'000'000;
+
+u32 mem_search_raw(const u8 *p, u32 size) {
+  if (size == 1) {
+    return p[0];
+  }
+
+  if (size == 2) {
+    return (u32{p[0]} << 8) | u32{p[1]};
+  }
+
+  return (u32{p[0]} << 24) | (u32{p[1]} << 16) | (u32{p[2]} << 8) | u32{p[3]};
+}
+
+double mem_search_number(u32 raw, bool is_float) {
+  if (is_float) {
+    float f = 0;
+    std::memcpy(&f, &raw, sizeof(f));
+    return f;
+  }
+
+  return raw;
+}
+
+std::string mem_search_text(u32 raw, bool is_float) {
+  if (is_float) {
+    char text[48]{};
+    std::snprintf(text, sizeof(text), "%g", mem_search_number(raw, true));
+    return text;
+  }
+
+  return fmt::format("%u", raw);
+}
+
+// What the user typed, as something a raw value can be compared with
+struct MemSearchValue {
+  bool valid = false;
+  double number = 0;
+  double tolerance = 0;
+};
+
+MemSearchValue mem_search_parse(const std::string &text, u32 size, bool is_float) {
+  MemSearchValue out;
+
+  if (text.empty()) {
+    return out;
+  }
+
+  char *end = nullptr;
+
+  if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+    out.number = static_cast<double>(std::strtoull(text.c_str() + 2, &end, 16));
+  } else {
+    out.number = std::strtod(text.c_str(), &end);
+  }
+
+  if (!end || *end != '\0') {
+    return out;
+  }
+
+  if (is_float) {
+    // "12" matches 12.0 to 12.99ish either side; "12.5" has to be close
+    out.tolerance = text.find('.') == std::string::npos ? 1.0 : 0.01;
+  } else if (out.number < 0) {
+    // Negative numbers are stored as two's complement
+    const double range = size == 1 ? 256.0 : size == 2 ? 65536.0 : 4294967296.0;
+    out.number += range;
+  }
+
+  out.valid = true;
+  return out;
+}
+
+bool mem_search_equal(u32 raw, bool is_float, const MemSearchValue &value) {
+  const double number = mem_search_number(raw, is_float);
+
+  if (is_float) {
+    return number == number && number - value.number < value.tolerance && value.number - number < value.tolerance;
+  }
+
+  return number == value.number;
+}
+
+std::string mem_search_reply(const MemSearchState &state) {
+  return fmt::format("ok %u %d %s", state.hits.size(), state.truncated ? 1 : 0, state.type.empty() ? "-" : state.type);
+}
+} // namespace
+
+extern "C" std::string _armsx3_memSearch(std::string_view command) {
+  std::lock_guard lock(g_mem_search.mtx);
+  MemSearchState &state = g_mem_search;
+
+  const std::vector<std::string> args = fmt::split(command, {" "});
+
+  if (args.empty()) {
+    return "err empty command";
+  }
+
+  if (args[0] == "reset") {
+    state.type.clear();
+    state.hits.clear();
+    state.hits.shrink_to_fit();
+    state.truncated = false;
+    return mem_search_reply(state);
+  }
+
+  if (Emu.IsStopped()) {
+    state.type.clear();
+    state.hits.clear();
+    return "err no game is running";
+  }
+
+  if (args[0] == "new") {
+    if (args.size() < 3) {
+      return "err usage: new <type> <value>";
+    }
+
+    u32 size = 4;
+    bool is_float = false;
+
+    if (args[1] == "u8") {
+      size = 1;
+    } else if (args[1] == "u16") {
+      size = 2;
+    } else if (args[1] == "u32") {
+      size = 4;
+    } else if (args[1] == "f32") {
+      is_float = true;
+    } else {
+      return "err unknown type";
+    }
+
+    const MemSearchValue value = mem_search_parse(args[2], size, is_float);
+
+    if (!value.valid) {
+      return "err not a number";
+    }
+
+    state.type = args[1];
+    state.size = size;
+    state.is_float = is_float;
+    state.truncated = false;
+    state.hits.clear();
+
+    // Main memory + user memory, then the stack area. Video memory is skipped.
+    static constexpr std::pair<u32, u32> s_ranges[] = {
+        {0x00010000u, 0x40000000u},
+        {0xD0000000u, 0xE0000000u},
+    };
+
+    std::vector<u8> page(4096);
+
+    for (const auto &[begin, end] : s_ranges) {
+      for (u32 addr = begin; addr < end && !state.truncated; addr += 4096) {
+        if (!vm::check_addr(addr, vm::page_readable, 4096) || !vm::try_access(addr, page.data(), 4096, false)) {
+          continue;
+        }
+
+        for (u32 off = 0; off + size <= 4096; off += size) {
+          const u32 raw = mem_search_raw(page.data() + off, size);
+
+          if (mem_search_equal(raw, is_float, value)) {
+            if (state.hits.size() >= mem_search_max_hits) {
+              state.truncated = true;
+              break;
+            }
+
+            state.hits.emplace_back(addr + off, raw);
+          }
+        }
+      }
+    }
+
+    return mem_search_reply(state);
+  }
+
+  if (state.type.empty()) {
+    return "err start a search first";
+  }
+
+  if (args[0] == "filter") {
+    if (args.size() < 2) {
+      return "err usage: filter <eq|ne|gt|lt|same> [value]";
+    }
+
+    const std::string &op = args[1];
+    MemSearchValue value;
+
+    if (op == "eq") {
+      value = mem_search_parse(args.size() > 2 ? args[2] : std::string{}, state.size, state.is_float);
+
+      if (!value.valid) {
+        return "err not a number";
+      }
+    } else if (op != "ne" && op != "gt" && op != "lt" && op != "same") {
+      return "err unknown filter";
+    }
+
+    std::vector<std::pair<u32, u32>> kept;
+    kept.reserve(state.hits.size() / 4);
+
+    for (const auto &[addr, old_raw] : state.hits) {
+      u8 buf[4]{};
+
+      if (!vm::try_access(addr, buf, state.size, false)) {
+        continue;
+      }
+
+      const u32 raw = mem_search_raw(buf, state.size);
+      const double now = mem_search_number(raw, state.is_float);
+      const double before = mem_search_number(old_raw, state.is_float);
+      bool keep = false;
+
+      if (op == "eq") {
+        keep = mem_search_equal(raw, state.is_float, value);
+      } else if (op == "ne") {
+        keep = raw != old_raw;
+      } else if (op == "same") {
+        keep = raw == old_raw;
+      } else if (op == "gt") {
+        keep = now > before;
+      } else {
+        keep = now < before;
+      }
+
+      if (keep) {
+        kept.emplace_back(addr, raw);
+      }
+    }
+
+    state.hits = std::move(kept);
+    return mem_search_reply(state);
+  }
+
+  if (args[0] == "list") {
+    usz max = 50;
+
+    if (args.size() > 1) {
+      max = static_cast<usz>(std::strtoul(args[1].c_str(), nullptr, 10));
+    }
+
+    std::string out = mem_search_reply(state);
+
+    for (usz i = 0; i < state.hits.size() && i < max; i++) {
+      u8 buf[4]{};
+      const u32 addr = state.hits[i].first;
+
+      if (!vm::try_access(addr, buf, state.size, false)) {
+        fmt::append(out, "\n%x ?", addr);
+        continue;
+      }
+
+      fmt::append(out, "\n%x %s", addr, mem_search_text(mem_search_raw(buf, state.size), state.is_float));
+    }
+
+    return out;
+  }
+
+  return "err unknown command";
+}
