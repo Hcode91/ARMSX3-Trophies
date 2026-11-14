@@ -377,8 +377,22 @@ object MemorySearch {
      * the game starts (see CUSTOM_TROPHIES.md).
      * Blocking: call off the main thread. Returns an error message, or null on success.
      */
+    /** The rule box takes a bare condition, but people paste whole `when: "..."` lines from
+     *  a rules file (or a chat) into it, sometimes on top of what was already there. Keep only
+     *  the condition itself. */
+    fun cleanRule(text: String): String {
+        var rule = text.trim()
+        val at = rule.lastIndexOf("when:")
+        if (at >= 0) rule = rule.substring(at + 5).trim()
+        rule = rule.replace("\\\"", "\"")
+        while (rule.length >= 2 && rule.startsWith("\"") && rule.endsWith("\"")) {
+            rule = rule.substring(1, rule.length - 1).trim()
+        }
+        return rule.trim('"').trim()
+    }
+
     fun createTrophy(context: Context): String? {
-        val rule = draftRule.value?.trim().orEmpty()
+        val rule = cleanRule(draftRule.value.orEmpty())
         val name = draftName.value.trim()
         val editIndex = editing.value
         if (name.isEmpty()) return "Give the trophy a name."
