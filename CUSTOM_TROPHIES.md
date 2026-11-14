@@ -99,7 +99,8 @@ mapped, the condition is simply false.
   inside brackets use `*` for "and": `count(button(cross) * ([0x1000] == 2)) >= 100` counts
   presses only while `[0x1000]` is 2 (say, while in a level rather than a menu).
 
-Rules that use `button()` are checked every frame rather than four times a second.
+Rule files that use `button()`, `count()` or `prev()` are checked every frame rather than four
+times a second, so short-lived events are not missed.
 
 ### Sequences
 

@@ -422,7 +422,7 @@ struct ct_rules_set
 	u64 last_check = 0;
 	u64 next_progress_write = 0;
 	bool progress_dirty = false;
-	bool fast = false;       // has button() rules: checked every frame instead of 4x a second
+	bool fast = false;       // has button(), count() or prev() rules: checked every frame instead of 4x a second
 	bool has_counts = false; // has count() rules: totals are saved to disk
 	f64 saved_counts = -1;
 	u64 next_counts_write = 0;
@@ -1917,12 +1917,14 @@ static void ct_load_counts(ct_rules_set& set, const std::string& trp_name)
 			index = 0;
 		}
 
-		if (op.type == ct_button)
+		if (op.type == ct_button || op.type == ct_prev)
 		{
+			// Presses and changes can be over within a frame or two
 			set.fast = true;
 		}
 		else if (op.type == ct_count)
 		{
+			set.fast = true;
 			set.has_counts = true;
 
 			if (const auto found = saved.find({id, index}); found != saved.end())
