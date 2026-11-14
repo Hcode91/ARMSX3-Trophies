@@ -398,6 +398,10 @@ struct ct_rules_set
 struct custom_trophy_state
 {
 	std::map<std::string, ct_rules_set> sets;
+
+	custom_trophy_state() = default;
+	custom_trophy_state(const custom_trophy_state&) = delete;
+	custom_trophy_state& operator=(const custom_trophy_state&) = delete;
 };
 
 struct ct_parser
@@ -925,101 +929,92 @@ static void ct_load(ct_rules_set& set, const std::string& trp_name)
 		return;
 	}
 
-	try
+	// Note: the core is built without C++ exceptions, so only non-throwing yaml-cpp calls are used here
+	const auto loaded = yaml_load(text);
+	const YAML::Node& root = loaded.first;
+
+	if (!loaded.second.empty() || !root.IsMap())
 	{
-		const auto loaded = yaml_load(text);
-		const YAML::Node& root = loaded.first;
+		sceNpTrophy.error("Custom trophy rules: failed to read '%s': %s", used_path, loaded.second);
+		return;
+	}
 
-		if (!loaded.second.empty() || !root.IsMap())
+	if (const YAML::Node node = root["original_count"]; node && node.IsScalar())
+	{
+		s32 value = -1;
+
+		if (ct_parse_int(node.Scalar(), value))
 		{
-			sceNpTrophy.error("Custom trophy rules: failed to read '%s': %s", used_path, loaded.second);
-			return;
+			set.original_count = value;
 		}
+	}
 
-		if (const YAML::Node node = root["original_count"]; node && node.IsScalar())
+	if (const YAML::Node node = root["remove"]; node && node.IsSequence())
+	{
+		for (const auto& entry : node)
 		{
 			s32 value = -1;
 
-			if (ct_parse_int(node.Scalar(), value))
+			if (entry.IsScalar() && ct_parse_int(entry.Scalar(), value))
 			{
-				set.original_count = value;
-			}
-		}
-
-		if (const YAML::Node node = root["remove"]; node && node.IsSequence())
-		{
-			for (const auto& entry : node)
-			{
-				s32 value = -1;
-
-				if (entry.IsScalar() && ct_parse_int(entry.Scalar(), value))
-				{
-					set.removed.insert(static_cast<u32>(value));
-				}
-			}
-		}
-
-		bool rules_allowed = true;
-
-		if (const YAML::Node node = root["game"]; node && node.IsScalar())
-		{
-			const std::string wanted = node.Scalar();
-			const std::string& actual = Emu.GetExecutableHash();
-
-			if (!wanted.empty() && wanted != actual)
-			{
-				sceNpTrophy.error("Custom trophy rules: '%s' is for %s but this game is %s. Memory rules are disabled.", used_path, wanted, actual);
-				rules_allowed = false;
-			}
-		}
-
-		if (const YAML::Node node = root["trophies"]; rules_allowed && node && node.IsMap())
-		{
-			for (const auto& entry : node)
-			{
-				ct_rule rule{};
-
-				if (!entry.first.IsScalar() || !ct_parse_int(entry.first.Scalar(), rule.id))
-				{
-					sceNpTrophy.error("Custom trophy rules: bad trophy id in '%s'", used_path);
-					continue;
-				}
-
-				const YAML::Node& value = entry.second;
-				const YAML::Node when = value.IsMap() ? value["when"] : value;
-				bool valid = true;
-
-				if (when && when.IsScalar())
-				{
-					ct_add_conditions(rule, when.Scalar(), valid);
-				}
-				else if (when && when.IsSequence())
-				{
-					for (const auto& item : when)
-					{
-						if (valid && item.IsScalar())
-						{
-							ct_add_conditions(rule, item.Scalar(), valid);
-						}
-					}
-				}
-
-				if (!valid || rule.all.empty() || set.is_removed(rule.id))
-				{
-					continue;
-				}
-
-				sceNpTrophy.notice("Custom trophy rules: trophy %d when %s", rule.id, rule.text);
-				set.rules.emplace_back(std::move(rule));
+				set.removed.insert(static_cast<u32>(value));
 			}
 		}
 	}
-	catch (const std::exception& e)
+
+	bool rules_allowed = true;
+
+	if (const YAML::Node node = root["game"]; node && node.IsScalar())
 	{
-		sceNpTrophy.error("Custom trophy rules: failed to read '%s': %s", used_path, e.what());
-		set = {};
-		set.loaded = true;
-		return;
+		const std::string wanted = node.Scalar();
+		const std::string& actual = Emu.GetExecutableHash();
+
+		if (!wanted.empty() && wanted != actual)
+		{
+			sceNpTrophy.error("Custom trophy rules: '%s' is for %s but this game is %s. Memory rules are disabled.", used_path, wanted, actual);
+			rules_allowed = false;
+		}
+	}
+
+	if (const YAML::Node node = root["trophies"]; rules_allowed && node && node.IsMap())
+	{
+		for (const auto& entry : node)
+		{
+			ct_rule rule{};
+
+			if (!entry.first.IsScalar() || !ct_parse_int(entry.first.Scalar(), rule.id))
+			{
+				sceNpTrophy.error("Custom trophy rules: bad trophy id in '%s'", used_path);
+				continue;
+			}
+
+			const YAML::Node& value = entry.second;
+			const YAML::Node when = value.IsMap() ? value["when"] : value;
+			bool valid = true;
+
+			if (when && when.IsScalar())
+			{
+				ct_add_conditions(rule, when.Scalar(), valid);
+			}
+			else if (when && when.IsSequence())
+			{
+				for (const auto& item : when)
+				{
+					if (valid && item.IsScalar())
+					{
+						ct_add_conditions(rule, item.Scalar(), valid);
+					}
+				}
+			}
+
+			if (!valid || rule.all.empty() || set.is_removed(rule.id))
+			{
+				continue;
+			}
+
+			sceNpTrophy.notice("Custom trophy rules: trophy %d when %s", rule.id, rule.text);
+			set.rules.emplace_back(std::move(rule));
+		}
 	}
 
 	sceNpTrophy.success("Custom trophy rules: loaded '%s' (%d rules, %d removed)", used_path, set.rules.size(), set.removed.size());
