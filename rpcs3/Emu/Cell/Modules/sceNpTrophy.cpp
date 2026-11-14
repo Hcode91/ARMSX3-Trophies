@@ -398,6 +398,7 @@ struct ct_rules_set
 struct custom_trophy_state
 {
 	std::map<std::string, ct_rules_set> sets;
+	std::map<std::string, std::set<s32>> traced; // Trophy ids already written to the trace this session
 
 	custom_trophy_state() = default;
 	custom_trophy_state(const custom_trophy_state&) = delete;
@@ -1031,6 +1032,83 @@ static ct_rules_set& ct_get_rules(const std::string& trp_name, bool reload = fal
 	}
 
 	return set;
+}
+
+// Trophy tracer: records which game code asked for a trophy, once per trophy and session.
+// The addresses are where to start looking (in the decrypted EBOOT) for the values that the
+// game checks, i.e. the raw material for writing custom trophy rules.
+// Written to the log and to home/<user>/trophy_rules/<NPWRxxxxx_00>_trace.txt.
+// Must be called with sce_np_trophy_manager::mtx held, on the PPU thread that made the request.
+static void ct_trace_request(ppu_thread& ppu, const trophy_context_t* ctxt, s32 trophyId, bool already_unlocked)
+{
+	if (!g_fxo->get<custom_trophy_state>().traced[ctxt->trp_name].insert(trophyId).second)
+	{
+		return;
+	}
+
+	// The game called the import stub from here
+	std::string chain = fmt::format("0x%x", static_cast<u32>(ppu.lr) - 4);
+
+	// Walk the PPC64 stack: [sp] is the caller's frame, its saved LR is at +16
+	u32 sp = static_cast<u32>(ppu.gpr[1]);
+
+	for (u32 depth = 0; depth < 8; depth++)
+	{
+		be_t<u64> back{};
+
+		if (!vm::try_access(sp, &back, sizeof(back), false))
+		{
+			break;
+		}
+
+		const u32 next = static_cast<u32>(back.value());
+
+		if (next <= sp)
+		{
+			break;
+		}
+
+		be_t<u64> saved_lr{};
+
+		if (!vm::try_access(next + 16, &saved_lr, sizeof(saved_lr), false))
+		{
+			break;
+		}
+
+		const u32 ret = static_cast<u32>(saved_lr.value());
+
+		if (ret < 0x10000)
+		{
+			break;
+		}
+
+		fmt::append(chain, " <- 0x%x", ret - 4);
+		sp = next;
+	}
+
+	const std::string line = fmt::format("trophy %d%s: requested from %s (r4=0x%x r5=0x%x r6=0x%x)", trophyId, already_unlocked ? " (already unlocked)" : "", chain, static_cast<u32>(ppu.gpr[4]), static_cast<u32>(ppu.gpr[5]), static_cast<u32>(ppu.gpr[6]));
+
+	sceNpTrophy.success("Trophy trace: %s", line);
+
+	const std::string dir = vfs::get("/dev_hdd0/home/" + Emu.GetUsr() + "/trophy_rules/");
+
+	if (dir.empty() || !fs::create_path(dir))
+	{
+		return;
+	}
+
+	const std::string path = dir + ctxt->trp_name + "_trace.txt";
+	const bool is_new = !fs::is_file(path);
+
+	if (fs::file file{path, fs::write + fs::create + fs::append})
+	{
+		if (is_new)
+		{
+			file.write(fmt::format("# Trophy trace for %s\n# game: %s (%s)\n# Each line: the game code that asked for the trophy, innermost call first.\n", ctxt->trp_name, Emu.GetExecutableHash(), Emu.GetTitleID()));
+		}
+
+		file.write(line + "\n");
+	}
 }
 
 // Shared by the game's own unlock requests and by the custom rules.
@@ -2004,6 +2082,8 @@ error_code sceNpTrophyUnlockTrophy(ppu_thread& ppu, u32 context, u32 handle, s32
 	{
 		return SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID;
 	}
+
+	ct_trace_request(ppu, ctxt, trophyId, !!ctxt->tropusr->GetTrophyUnlockState(trophyId));
 
 	if (ctxt->tropusr->GetTrophyGrade(trophyId) == SCE_NP_TROPHY_GRADE_PLATINUM)
 	{

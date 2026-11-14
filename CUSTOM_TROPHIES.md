@@ -61,3 +61,18 @@ Rules are checked about four times a second, so they suit values that stay in me
 
 Custom trophies, trophies awarded by a rule, removed trophies, and a platinum from a set that
 uses rules are never sent to RPCN.
+
+## Trophy tracer
+
+Whenever the game itself asks for a trophy, the emulator notes which game code made the
+request (once per trophy per session), in the log and in
+`dev_hdd0/home/<user>/trophy_rules/<NPWRxxxxx_00>_trace.txt`:
+
+```
+trophy 3: requested from 0x3e1f0 <- 0x41a2c <- 0x40b10 (r4=... r5=... r6=...)
+```
+
+The addresses are call sites, innermost first. Looking at that code in the decrypted EBOOT
+shows which values the game checks before awarding the trophy, which is the starting point
+for a new rule (e.g. the same counter with a different target). It also fires for trophies
+that are already unlocked, as long as the game still asks for them.
