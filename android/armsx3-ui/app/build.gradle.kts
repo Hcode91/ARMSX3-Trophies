@@ -142,6 +142,17 @@ android {
     // Absent, only the debug key exists and release builds stay sideload-only. The file is
     // gitignored and nothing here echoes its contents.
     signingConfigs {
+        // ARMSX3-Trophies: a fixed debug key that lives in the repo. Without it every CI
+        // runner invents its own debug key, so no build could be installed over the previous
+        // one. It is a sideload-only test key, not a secret.
+        getByName("debug") {
+            storeFile = file("trophies-debug.p12")
+            storeType = "PKCS12"
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+
         val props = rootProject.file("keystore.properties")
 
         if (props.exists()) {
