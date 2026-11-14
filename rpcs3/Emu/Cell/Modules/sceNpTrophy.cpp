@@ -1230,6 +1230,25 @@ void sceNpTrophy_check_custom_rules(ppu_thread& ppu)
 			// Removing trophies may have completed a platinum that was already earned otherwise
 			rules.platinum_checked = true;
 
+			// First check for this set: say so if a rule can never fire
+			for (const ct_rule& rule : rules.rules)
+			{
+				if (rule.id >= count)
+				{
+					sceNpTrophy.error("Custom trophy rules: trophy %d has a rule but the trophy data only has %d trophies. TROPHY.TRP and TROPUSR.DAT must both include it.", rule.id, count);
+				}
+				else if (ctxt->tropusr->GetTrophyUnlockState(rule.id))
+				{
+					sceNpTrophy.notice("Custom trophy rules: trophy %d is already unlocked", rule.id);
+				}
+				else
+				{
+					f64 now = 0;
+					const bool readable = !rule.all.empty() && ct_eval(rule.all[0].lhs, now);
+					sceNpTrophy.notice("Custom trophy rules: trophy %d is locked, watching (%s; first value is %s)", rule.id, rule.text, readable ? fmt::format("%d", static_cast<s64>(now)) : std::string("not readable yet"));
+				}
+			}
+
 			for (const u32 id : rules.removed)
 			{
 				if (id < static_cast<u32>(count))
