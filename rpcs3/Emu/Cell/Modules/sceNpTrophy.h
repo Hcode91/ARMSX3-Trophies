@@ -179,3 +179,6 @@ class ppu_thread;
 
 // Custom trophy rules (ARMSX3-Trophies): evaluates the optional rules file of the registered trophy sets
 void sceNpTrophy_check_custom_rules(ppu_thread& ppu);
+
+// Current value of a rule expression (memory search watch list). False if unreadable.
+bool sceNpTrophy_eval_expression(std::string_view text, f64& result);

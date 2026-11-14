@@ -38,6 +38,10 @@ import com.armsx2.ui.common.RoundAction
 import com.armsx3.core.ARMSX3
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import com.armsx2.ui.settings.controllerFocusable
+import androidx.compose.foundation.background
+import androidx.compose.runtime.LaunchedEffect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -140,6 +144,85 @@ object MemorySearch {
         val prefix = if (type.value == "u32") "" else type.value
         val target = value.value.trim().ifEmpty { hit.value }
         return "$prefix[0x${hit.address}] >= $target"
+    }
+
+    // ---- Watch list: expressions whose live value is shown, here and over the game. ----
+    // Kept per trophy set in trophy_rules/<set>_watch.txt, so it survives a restart: that is
+    // how a pointer is checked (add the candidates, restart the game, see which still shows
+    // the right number).
+    val watches = mutableStateOf<List<String>>(emptyList())
+    val watchValues = mutableStateOf<Map<String, String>>(emptyMap())
+    /** Show the watch list (and the filter buttons) over the running game. */
+    val overlay = mutableStateOf(false)
+    private var watchSet = ""
+
+    private fun watchFile(): File? {
+        val set = runCatching { ARMSX3.instance.getCurrentTrophyName() }.getOrNull()?.trim().orEmpty()
+        if (set.isEmpty()) return null
+        val user = runCatching { ARMSX3.instance.getUser() }.getOrNull()?.takeIf { it.isNotBlank() } ?: "00000001"
+        return File(File(ARMSX3.getHdd0Dir(), "home/$user/trophy_rules"), "${set}_watch.txt")
+    }
+
+    /** Loads the running game's saved watch list (once per game). Blocking. */
+    fun loadWatches() {
+        val file = watchFile() ?: return
+        if (file.path == watchSet) return
+        watchSet = file.path
+        watches.value = runCatching {
+            if (file.isFile) file.readLines().map { it.trim() }.filter { it.isNotEmpty() }.distinct().take(12) else emptyList()
+        }.getOrDefault(emptyList())
+    }
+
+    private fun saveWatches() {
+        val file = watchFile() ?: return
+        runCatching {
+            file.parentFile?.mkdirs()
+            file.writeText(watches.value.joinToString("\n"))
+        }
+    }
+
+    /** Blocking. */
+    fun addWatch(expr: String) {
+        val clean = expr.trim()
+        if (clean.isEmpty() || clean in watches.value) return
+        watches.value = (watches.value + clean).takeLast(12)
+        saveWatches()
+        pollWatches()
+    }
+
+    /** Blocking. */
+    fun removeWatch(expr: String) {
+        watches.value = watches.value - expr
+        saveWatches()
+    }
+
+    /** Re-reads every watched value. Blocking. */
+    fun pollWatches() {
+        val list = watches.value
+        if (list.isEmpty()) {
+            if (watchValues.value.isNotEmpty()) watchValues.value = emptyMap()
+            return
+        }
+        watchValues.value = list.associateWith { expr ->
+            val reply = call("eval $expr")
+            if (reply.startsWith("ok")) reply.removePrefix("ok").trim() else "?"
+        }
+    }
+
+    /** Candidate count only, for the overlay. Blocking. */
+    fun pollCount() {
+        val head = call("list 0").lines().firstOrNull().orEmpty().split(' ')
+        count.value = if (head.firstOrNull() == "ok" && head.size >= 4 && head[3] != "-") head[1].toIntOrNull() ?: 0 else -1
+    }
+
+    /** The value part of a rule: "[0x10] >= 5" -> "[0x10]". */
+    fun exprOf(rule: String): String {
+        var cut = rule.length
+        for (op in listOf(">=", "<=", "==", "!=", ">", "<")) {
+            val at = rule.lastIndexOf(op)
+            if (at in 1 until cut) cut = at
+        }
+        return rule.substring(0, cut).trim()
     }
 
     // ---- "Create trophy" form. Non-null draftRule = the form is open. ----
@@ -254,6 +337,12 @@ fun MemorySearchScreen(onBack: () -> Unit) {
 
     // Pick up a search that is still alive in the core from an earlier visit.
     androidx.compose.runtime.LaunchedEffect(Unit) { run(null) }
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) {
+            MemorySearch.loadWatches()
+            MemorySearch.pollWatches()
+        }
+    }
 
     ArmsBackdrop {
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
@@ -320,6 +409,13 @@ fun MemorySearchScreen(onBack: () -> Unit) {
                         enabled = !busy && MemorySearch.draftName.value.isNotBlank(),
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Create trophy") }
+                    OutlinedButton(
+                        onClick = {
+                            launchWork(scope) { MemorySearch.addWatch(MemorySearch.exprOf(draft)) }
+                            MemorySearch.draftRule.value = null
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Just watch this value for now") }
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         OutlinedButton(onClick = { copyText(draft) }) { Text("Copy rule text") }
                         OutlinedButton(onClick = { MemorySearch.draftRule.value = null; MemorySearch.message.value = "" }) { Text("Cancel") }
@@ -380,14 +476,18 @@ fun MemorySearchScreen(onBack: () -> Unit) {
                     Button(
                         onClick = { run("new ${MemorySearch.type.value} $typed") },
                         enabled = !busy && typed.isNotEmpty(),
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.fillMaxWidth().controllerFocusable("memsearch.search", onConfirm = {
+                            if (!busy && typed.isNotEmpty()) run("new ${MemorySearch.type.value} $typed")
+                        }),
                     ) { Text("Search") }
 
                     // For values the game never shows, like a hidden "blocks destroyed" count.
                     OutlinedButton(
                         onClick = { run("new ${MemorySearch.type.value} ?") },
                         enabled = !busy,
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.fillMaxWidth().controllerFocusable("memsearch.unknown", onConfirm = {
+                            if (!busy) run("new ${MemorySearch.type.value} ?")
+                        }),
                     ) { Text("I don't know the number") }
                 } else {
                     Button(
@@ -404,10 +504,56 @@ fun MemorySearchScreen(onBack: () -> Unit) {
                         FilterButton("Changed", "filter ne", busy, run)
                         FilterButton("Stayed the same", "filter same", busy, run)
                     }
+                    if (typed.isNotEmpty()) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            FilterButton("Up by exactly $typed", "filter inc $typed", busy, run)
+                            FilterButton("Down by exactly $typed", "filter dec $typed", busy, run)
+                        }
+                    }
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         OutlinedButton(onClick = { run(null) }, enabled = !busy) { Text("Refresh values") }
                         OutlinedButton(onClick = { run("reset") }, enabled = !busy) { Text("Start over") }
                     }
+                }
+
+                // Watch list + the over-the-game overlay
+                val watches = MemorySearch.watches.value
+                OutlinedButton(
+                    onClick = { MemorySearch.overlay.value = !MemorySearch.overlay.value },
+                    modifier = Modifier.fillMaxWidth().controllerFocusable("memsearch.overlay", onConfirm = {
+                        MemorySearch.overlay.value = !MemorySearch.overlay.value
+                    }),
+                ) {
+                    Text(
+                        if (MemorySearch.overlay.value) "Showing values and filter buttons over the game - tap to hide"
+                        else "Show values and filter buttons over the game",
+                    )
+                }
+                if (watches.isNotEmpty()) {
+                    Text(
+                        "Watching (kept after a restart, so a pointer that still shows the right number is a good one):",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    val values = MemorySearch.watchValues.value
+                    watches.forEach { expr ->
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant,
+                            modifier = Modifier.fillMaxWidth().clickable { MemorySearch.openDraft("$expr >= ${values[expr] ?: "1"}") },
+                        ) {
+                            Row(
+                                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                            ) {
+                                Text(expr, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f))
+                                Text(values[expr] ?: "?", fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.primary)
+                                OutlinedButton(onClick = { launchWork(scope) { MemorySearch.removeWatch(expr) } }) { Text("Remove") }
+                            }
+                        }
+                    }
+                    OutlinedButton(onClick = { launchWork(scope) { MemorySearch.pollWatches() } }, enabled = !busy) { Text("Refresh watched values") }
                 }
 
                 val message = MemorySearch.message.value
@@ -476,6 +622,12 @@ fun MemorySearchScreen(onBack: () -> Unit) {
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
+                            if (pointers.isNotEmpty()) {
+                                OutlinedButton(
+                                    onClick = { launchWork(scope) { pointers.take(8).forEach { MemorySearch.addWatch("[$it]") } } },
+                                    enabled = !busy,
+                                ) { Text("Watch the first ${minOf(8, pointers.size)} to check them after a restart") }
+                            }
                             pointers.forEach { expr ->
                                 Surface(
                                     shape = RoundedCornerShape(12.dp),
@@ -533,9 +685,12 @@ private fun launchWork(scope: CoroutineScope, work: () -> Unit) {
 @Composable
 private fun TypeButton(type: String, label: String) {
     if (MemorySearch.type.value == type) {
-        Button(onClick = {}) { Text(label) }
+        Button(onClick = {}, modifier = Modifier.controllerFocusable("memsearch.type.$type")) { Text(label) }
     } else {
-        OutlinedButton(onClick = { MemorySearch.type.value = type }) { Text(label) }
+        OutlinedButton(
+            onClick = { MemorySearch.type.value = type },
+            modifier = Modifier.controllerFocusable("memsearch.type.$type", onConfirm = { MemorySearch.type.value = type }),
+        ) { Text(label) }
     }
 }
 
@@ -550,5 +705,90 @@ private fun GradeButton(grade: String, label: String) {
 
 @Composable
 private fun FilterButton(label: String, command: String, busy: Boolean, run: (String?) -> Unit) {
-    OutlinedButton(onClick = { run(command) }, enabled = !busy) { Text(label) }
+    OutlinedButton(
+        onClick = { run(command) },
+        enabled = !busy,
+        modifier = Modifier.controllerFocusable("memsearch.$command", onConfirm = { if (!busy) run(command) }),
+    ) { Text(label) }
+}
+
+/**
+ * The watch list and the filter buttons, drawn over the RUNNING game so a search does not need
+ * a trip to the menu for every round. Composed from WindowImpl next to the touch controls;
+ * draws nothing unless it was switched on from the memory search screen.
+ */
+@Composable
+fun MemoryWatchOverlay() {
+    if (!MemorySearch.overlay.value) return
+    // Not while a menu or a full screen covers the game.
+    if (com.armsx2.ui.WindowImpl.frontendCovers) return
+
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            withContext(Dispatchers.IO) {
+                MemorySearch.loadWatches()
+                MemorySearch.pollWatches()
+                if (!MemorySearch.busy.value) MemorySearch.pollCount()
+            }
+            delay(500)
+        }
+    }
+
+    val watches = MemorySearch.watches.value
+    val values = MemorySearch.watchValues.value
+    val count = MemorySearch.count.value
+    val busy = MemorySearch.busy.value
+
+    Column(
+        Modifier
+            .padding(start = 8.dp, top = 8.dp)
+            .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        watches.take(6).forEach { expr ->
+            Text(
+                "${values[expr] ?: "?"}   $expr",
+                fontFamily = FontFamily.Monospace,
+                color = androidx.compose.ui.graphics.Color.White,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        if (count >= 0) {
+            Text(
+                if (busy) "Filtering…" else "$count matches",
+                color = androidx.compose.ui.graphics.Color.White,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                OverlayChip("Up") { launchWork(scope) { MemorySearch.execute("filter gt") } }
+                OverlayChip("Down") { launchWork(scope) { MemorySearch.execute("filter lt") } }
+                OverlayChip("Same") { launchWork(scope) { MemorySearch.execute("filter same") } }
+                OverlayChip("Changed") { launchWork(scope) { MemorySearch.execute("filter ne") } }
+            }
+        }
+        if (watches.isEmpty() && count < 0) {
+            Text(
+                "Nothing to watch yet",
+                color = androidx.compose.ui.graphics.Color.White,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        OverlayChip("Hide") { MemorySearch.overlay.value = false }
+    }
+}
+
+@Composable
+private fun OverlayChip(label: String, onClick: () -> Unit) {
+    Text(
+        label,
+        color = androidx.compose.ui.graphics.Color.White,
+        style = MaterialTheme.typography.bodySmall,
+        modifier = Modifier
+            .background(androidx.compose.ui.graphics.Color.White.copy(alpha = 0.18f), RoundedCornerShape(8.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+    )
 }

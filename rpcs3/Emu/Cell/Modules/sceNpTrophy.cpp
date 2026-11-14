@@ -1771,6 +1771,33 @@ static u32 ct_merge_custom(ct_rules_set& set, const std::string& trp_name)
 	return count + static_cast<u32>(set.custom.size());
 }
 
+// For the memory search's watch list: the current value of an expression such as
+// "u16[[[0x1f6a00]+0xf4]+0x4]". False if it cannot be parsed or read right now.
+bool sceNpTrophy_eval_expression(std::string_view text, f64& result)
+{
+	std::vector<ct_op> ops;
+
+	ct_parser parser{};
+	parser.s = text;
+	parser.out = &ops;
+
+	if (!parser.cmp_expr() || !parser.at_end())
+	{
+		return false;
+	}
+
+	for (const ct_op& op : ops)
+	{
+		// These need state or a trophy context, which a one-off read does not have
+		if (op.type == ct_delta || op.type == ct_prev || op.type == ct_count || op.type == ct_trophy)
+		{
+			return false;
+		}
+	}
+
+	return ct_eval(ops, ct_eval_ctx{}, result);
+}
+
 // Calls func(rule id, op) for every operation of every rule, always in the same order
 template <typename F>
 static void ct_for_each_op(ct_rules_set& set, F&& func)

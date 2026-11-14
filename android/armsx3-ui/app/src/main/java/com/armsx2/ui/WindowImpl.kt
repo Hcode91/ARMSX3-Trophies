@@ -135,6 +135,10 @@ object WindowImpl {
                     com.armsx2.ui.touch.TouchControlsOverlay()
                 }
 
+                // Memory search: watched values and filter buttons over the running game
+                // (ARMSX3-Trophies). Draws nothing unless switched on from that screen.
+                com.armsx2.ui.trophies.MemoryWatchOverlay()
+
                 // The keys the IME does not have (arrows, Esc, Tab, function row), shown only
                 // while the emulated keyboard is up. Outside the density override above: this
                 // is normal UI and should scale with the UI scale setting, unlike the touch

@@ -8807,8 +8807,10 @@ extern "C" void *_armsx3_setCustomDriver(void *driverHandle) {
 //   list <max>                       current candidates with their live values
 //   reset                            drop the search
 //   info                             "ok <PPU hash of the running game>"
+//   eval <expression>                current value of a rule expression, "ok <value>"
+//   filter <inc|dec> <n>             keep candidates that went up / down by exactly n
 //   pointer <hex addr>               find fixed places that point at (or just before)
-//                                    an address, directly or through one more pointer.
+//                                    an address, directly or through up to two more pointers.
 //                                    Reply lines are address expressions such as
 //                                    "[0xf3f20]+0x48" or "[[0xf3c18]+0x124]+0x1c".
 //
@@ -8974,6 +8976,32 @@ extern "C" std::string _armsx3_memSearch(std::string_view command) {
     return "ok " + Emu.GetExecutableHash();
   }
 
+  if (args[0] == "eval") {
+    // Everything after "eval " is the expression (it may contain spaces)
+    const usz start = command.find("eval");
+    std::string_view expr = command.substr(start + 4);
+
+    while (!expr.empty() && expr.front() == ' ') {
+      expr.remove_prefix(1);
+    }
+
+    f64 value = 0;
+
+    if (expr.empty() || !sceNpTrophy_eval_expression(expr, value)) {
+      return "err unreadable";
+    }
+
+    char text[48]{};
+
+    if (value == static_cast<f64>(static_cast<s64>(value)) && value > -9.0e15 && value < 9.0e15) {
+      std::snprintf(text, sizeof(text), "%lld", static_cast<long long>(value));
+    } else {
+      std::snprintf(text, sizeof(text), "%g", value);
+    }
+
+    return std::string("ok ") + text;
+  }
+
   if (args[0] == "pointer") {
     if (args.size() < 2) {
       return "err usage: pointer <hex address>";
@@ -9078,6 +9106,82 @@ extern "C" std::string _armsx3_memSearch(std::string_view command) {
 
       for (usz i = 0; i < chains.size() && lines.size() < max_results * 2; i++) {
         lines.emplace_back(fmt::format("[[0x%x]+0x%x]+0x%x", chains[i].loc, chains[i].off2, chains[i].off1));
+      }
+    }
+
+    // Third level, for games that bury their data deeper: fixed -> movable -> movable -> value.
+    // Only tried when the shorter routes found little, since longer chains are more often
+    // coincidences.
+    if (!movable.empty() && lines.size() < max_results) {
+      struct Mid {
+        u32 loc;
+        u32 off2;
+        u32 off1;
+      };
+
+      std::vector<Mid> mids;
+
+      for (u32 addr = static_end; addr < 0x40000000u && mids.size() < max_movable; addr += 4096) {
+        if (!vm::check_addr(addr, vm::page_readable, 4096) || !vm::try_access(addr, page.data(), 4096, false)) {
+          continue;
+        }
+
+        for (u32 off = 0; off < 4096 && mids.size() < max_movable; off += 4) {
+          const u32 value = mem_search_raw(page.data() + off, 4);
+
+          if (value < static_end) {
+            continue;
+          }
+
+          auto it = std::lower_bound(movable.begin(), movable.end(), std::pair<u32, u32>{value, 0});
+
+          for (; it != movable.end() && it->first - value < max_offset && mids.size() < max_movable; ++it) {
+            if (it->first != addr + off) {
+              mids.push_back(Mid{addr + off, it->first - value, it->second});
+            }
+          }
+        }
+      }
+
+      std::sort(mids.begin(), mids.end(), [](const Mid &a, const Mid &b) { return a.loc < b.loc; });
+
+      struct Chain3 {
+        u32 loc;
+        u32 off3;
+        u32 off2;
+        u32 off1;
+      };
+
+      std::vector<Chain3> chains;
+
+      for (u32 addr = 0x00010000u; addr < static_end && chains.size() < 2000 && !mids.empty(); addr += 4096) {
+        if (!vm::check_addr(addr, vm::page_readable, 4096) || !vm::try_access(addr, page.data(), 4096, false)) {
+          continue;
+        }
+
+        for (u32 off = 0; off < 4096; off += 4) {
+          const u32 value = mem_search_raw(page.data() + off, 4);
+
+          if (value < static_end) {
+            continue;
+          }
+
+          auto it = std::lower_bound(mids.begin(), mids.end(), value, [](const Mid &mid, u32 v) { return mid.loc < v; });
+
+          for (; it != mids.end() && it->loc - value < max_offset; ++it) {
+            chains.push_back(Chain3{addr + off, it->loc - value, it->off2, it->off1});
+          }
+        }
+      }
+
+      std::sort(chains.begin(), chains.end(), [](const Chain3 &a, const Chain3 &b) {
+        const u32 sa = a.off1 + a.off2 + a.off3;
+        const u32 sb = b.off1 + b.off2 + b.off3;
+        return sa != sb ? sa < sb : a.loc < b.loc;
+      });
+
+      for (usz i = 0; i < chains.size() && i < 15; i++) {
+        lines.emplace_back(fmt::format("[[[0x%x]+0x%x]+0x%x]+0x%x", chains[i].loc, chains[i].off3, chains[i].off2, chains[i].off1));
       }
     }
 
@@ -9201,6 +9305,12 @@ extern "C" std::string _armsx3_memSearch(std::string_view command) {
       if (!value.valid) {
         return "err not a number";
       }
+    } else if (op == "inc" || op == "dec") {
+      value = mem_search_parse(args.size() > 2 ? args[2] : std::string{}, 4, true);
+
+      if (!value.valid || value.number <= 0) {
+        return "err not a number";
+      }
     } else if (op != "ne" && op != "gt" && op != "lt" && op != "same") {
       return "err unknown filter";
     }
@@ -9220,6 +9330,13 @@ extern "C" std::string _armsx3_memSearch(std::string_view command) {
 
       const double now = mem_search_number(raw, state.is_float);
       const double before = mem_search_number(old_raw, state.is_float);
+
+      if (op == "inc" || op == "dec") {
+        // Changed by exactly this much
+        const double change = op == "inc" ? now - before : before - now;
+        const double off = change - value.number;
+        return off > -0.001 && off < 0.001;
+      }
 
       // NaN compares false both ways, so junk floats drop out
       return op == "gt" ? now > before : now < before;

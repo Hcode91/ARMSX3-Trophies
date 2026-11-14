@@ -159,8 +159,18 @@ the list is short.
 Number types: whole number (`u32`, the usual one), small (`u16`), tiny (`u8`) and decimal
 (`f32`, for things like health bars and timers).
 
+Other filters: type a number and use "up by exactly" / "down by exactly" for values that
+change in known steps.
+
+**Watching values.** Tap a result and choose "Just watch this value for now" to add it to the
+watch list, which shows live values. "Show values and filter buttons over the game" puts the
+watch list, the match count and Up / Down / Same / Changed buttons on top of the running game,
+so a search does not need a trip to the menu each round. The watch list is saved per game:
+add a few pointer candidates, restart the game, and the ones that still show the right number
+are the real pointers.
+
 An address found this way is right for the current session, but many games put their data
 somewhere new each time they start. **Find pointer** on a result looks for fixed places in
-the game's own data that lead to that address, directly (`[[0xF3F20]+0x48]`) or through one
-more pointer (`[[[0xF3C18]+0x124]+0x1C]`), and lists them likeliest first. A pointer rule
+the game's own data that lead to that address, directly (`[[0xF3F20]+0x48]`) or through one or
+two more pointers (`[[[0xF3C18]+0x124]+0x1C]`), and lists them likeliest first. A pointer rule
 keeps working after a restart; if the first one does not, try the next.
