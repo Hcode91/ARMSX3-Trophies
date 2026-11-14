@@ -8806,6 +8806,10 @@ extern "C" void *_armsx3_setCustomDriver(void *driverHandle) {
 //                                    went down / stayed the same since last time
 //   list <max>                       current candidates with their live values
 //   reset                            drop the search
+//   pointer <hex addr>               find fixed places that point at (or just before)
+//                                    an address, directly or through one more pointer.
+//                                    Reply lines are address expressions such as
+//                                    "[0xf3f20]+0x48" or "[[0xf3c18]+0x124]+0x1c".
 //
 // Reply: "ok <count> <truncated 0|1> <type>" then, for list, "<hex addr> <value>"
 // lines; or "err <message>".
@@ -8962,6 +8966,123 @@ extern "C" std::string _armsx3_memSearch(std::string_view command) {
     state.type.clear();
     state.clear();
     return "err no game is running";
+  }
+
+  if (args[0] == "pointer") {
+    if (args.size() < 2) {
+      return "err usage: pointer <hex address>";
+    }
+
+    char *end = nullptr;
+    const u64 target64 = std::strtoull(args[1].c_str(), &end, 16);
+
+    if (!end || *end != '\0' || target64 < 0x10000 || target64 > 0xFFFFFFFFull) {
+      return "err not an address";
+    }
+
+    const u32 target = static_cast<u32>(target64);
+
+    // A game's own data (which never moves) sits low in memory; everything it allocates
+    // while running sits higher and can move between sessions.
+    constexpr u32 static_end = 0x10000000u;
+    constexpr u32 max_offset = 0x1000u;
+    constexpr usz max_results = 25;
+    constexpr usz max_movable = 4000;
+
+    std::vector<std::pair<u32, u32>> fixed;   // location, offset
+    std::vector<std::pair<u32, u32>> movable; // location, offset
+    std::vector<u8> page(4096);
+
+    for (u32 addr = 0x00010000u; addr < 0x40000000u; addr += 4096) {
+      if (!vm::check_addr(addr, vm::page_readable, 4096) || !vm::try_access(addr, page.data(), 4096, false)) {
+        continue;
+      }
+
+      for (u32 off = 0; off < 4096; off += 4) {
+        const u32 value = mem_search_raw(page.data() + off, 4);
+
+        if (value > target || target - value >= max_offset || value < 0x10000) {
+          continue;
+        }
+
+        const u32 loc = addr + off;
+
+        if (loc == target) {
+          continue;
+        }
+
+        if (loc < static_end) {
+          fixed.emplace_back(loc, target - value);
+        } else if (movable.size() < max_movable) {
+          movable.emplace_back(loc, target - value);
+        }
+      }
+    }
+
+    // Smallest offset first: the closer a pointer lands, the more likely it is the real one
+    const auto by_offset = [](const std::pair<u32, u32> &a, const std::pair<u32, u32> &b) {
+      return a.second != b.second ? a.second < b.second : a.first < b.first;
+    };
+
+    std::sort(fixed.begin(), fixed.end(), by_offset);
+
+    std::vector<std::string> lines;
+
+    for (usz i = 0; i < fixed.size() && lines.size() < max_results; i++) {
+      lines.emplace_back(fmt::format("[0x%x]+0x%x", fixed[i].first, fixed[i].second));
+    }
+
+    // Second level: fixed places that point at one of the movable pointers found above
+    if (!movable.empty()) {
+      std::sort(movable.begin(), movable.end());
+
+      struct Chain {
+        u32 loc;
+        u32 off2;
+        u32 off1;
+      };
+
+      std::vector<Chain> chains;
+
+      for (u32 addr = 0x00010000u; addr < static_end && chains.size() < 2000; addr += 4096) {
+        if (!vm::check_addr(addr, vm::page_readable, 4096) || !vm::try_access(addr, page.data(), 4096, false)) {
+          continue;
+        }
+
+        for (u32 off = 0; off < 4096; off += 4) {
+          const u32 value = mem_search_raw(page.data() + off, 4);
+
+          if (value < static_end) {
+            continue;
+          }
+
+          auto it = std::lower_bound(movable.begin(), movable.end(), std::pair<u32, u32>{value, 0});
+
+          for (; it != movable.end() && it->first - value < max_offset; ++it) {
+            chains.push_back(Chain{addr + off, it->first - value, it->second});
+          }
+        }
+      }
+
+      std::sort(chains.begin(), chains.end(), [](const Chain &a, const Chain &b) {
+        const u32 sa = a.off1 + a.off2;
+        const u32 sb = b.off1 + b.off2;
+        return sa != sb ? sa < sb : a.loc < b.loc;
+      });
+
+      for (usz i = 0; i < chains.size() && lines.size() < max_results * 2; i++) {
+        lines.emplace_back(fmt::format("[[0x%x]+0x%x]+0x%x", chains[i].loc, chains[i].off2, chains[i].off1));
+      }
+    }
+
+    std::string out = fmt::format("ok %u 0 ptr", lines.size());
+
+    for (const std::string &line : lines) {
+      out += '\n';
+      out += line;
+    }
+
+    return out;
   }
 
   if (args[0] == "new") {

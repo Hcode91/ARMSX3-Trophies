@@ -60,10 +60,38 @@ object MemorySearch {
     val count = mutableStateOf(-1)
     val truncated = mutableStateOf(false)
     val hits = mutableStateOf<List<Hit>>(emptyList())
+    /** Address the pointer list below belongs to ("" = none looked up yet). */
+    val pointerFor = mutableStateOf("")
+    /** Address expressions such as "[0xf3f20]+0x48", from the core's `pointer` command. */
+    val pointers = mutableStateOf<List<String>>(emptyList())
+
+    /** Looks for fixed places that lead to [address]. Blocking: call off the main thread. */
+    fun findPointers(address: String) {
+        val lines = call("pointer $address").lines()
+        pointerFor.value = address
+        if (lines.firstOrNull().orEmpty().startsWith("ok")) {
+            pointers.value = lines.drop(1).map { it.trim() }.filter { it.isNotEmpty() }
+            message.value = ""
+        } else {
+            pointers.value = emptyList()
+            message.value = lines.firstOrNull().orEmpty().removePrefix("err").trim()
+        }
+    }
+
+    /** The rules-file line that reads the value through pointer expression [expr]. */
+    fun pointerRule(expr: String, fallbackValue: String): String {
+        val prefix = if (type.value == "u32") "" else type.value
+        val target = value.value.trim().ifEmpty { fallbackValue }
+        return "when: \"$prefix[$expr] >= $target\""
+    }
 
     /** Runs [command], then re-reads the first results. Blocking: call off the main thread. */
     fun execute(command: String?) {
         if (command != null) {
+            if (command.startsWith("new") || command == "reset") {
+                pointerFor.value = ""
+                pointers.value = emptyList()
+            }
             val reply = call(command)
             if (reply.startsWith("err")) {
                 message.value = reply.removePrefix("err").trim()
@@ -120,6 +148,11 @@ fun MemorySearchScreen(onBack: () -> Unit) {
     val active = count >= 0
 
     val run: (String?) -> Unit = { command -> launchSearch(scope, command) }
+    val copy: (String) -> Unit = { rule ->
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        clipboard?.setPrimaryClip(ClipData.newPlainText("Trophy rule", rule))
+        Toast.makeText(context, "Copied: $rule", Toast.LENGTH_SHORT).show()
+    }
 
     // Pick up a search that is still alive in the core from an earlier visit.
     androidx.compose.runtime.LaunchedEffect(Unit) { run(null) }
@@ -241,16 +274,12 @@ fun MemorySearchScreen(onBack: () -> Unit) {
                         Surface(
                             shape = RoundedCornerShape(12.dp),
                             color = MaterialTheme.colorScheme.surfaceVariant,
-                            modifier = Modifier.fillMaxWidth().clickable {
-                                val rule = MemorySearch.ruleFor(hit)
-                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                                clipboard?.setPrimaryClip(ClipData.newPlainText("Trophy rule", rule))
-                                Toast.makeText(context, "Copied: $rule", Toast.LENGTH_SHORT).show()
-                            },
+                            modifier = Modifier.fillMaxWidth().clickable { copy(MemorySearch.ruleFor(hit)) },
                         ) {
                             Row(
-                                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
                                 horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
                             ) {
                                 Text(
                                     "0x${hit.address}",
@@ -262,6 +291,40 @@ fun MemorySearchScreen(onBack: () -> Unit) {
                                     fontFamily = FontFamily.Monospace,
                                     color = MaterialTheme.colorScheme.primary,
                                 )
+                                OutlinedButton(
+                                    onClick = { launchWork(scope) { MemorySearch.findPointers(hit.address) } },
+                                    enabled = !busy,
+                                ) { Text("Find pointer") }
+                            }
+                        }
+
+                        if (MemorySearch.pointerFor.value == hit.address) {
+                            val pointers = MemorySearch.pointers.value
+                            Text(
+                                if (pointers.isEmpty()) {
+                                    "No pointer found for 0x${hit.address}. A plain address rule may still work; " +
+                                        "check it after restarting the game."
+                                } else {
+                                    "Pointer rules for 0x${hit.address} (likeliest first). Tap one to copy. " +
+                                        "These should keep working after a restart; if one does not, try the next."
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            pointers.forEach { expr ->
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = MaterialTheme.colorScheme.secondaryContainer,
+                                    modifier = Modifier.fillMaxWidth()
+                                        .clickable { copy(MemorySearch.pointerRule(expr, hit.value)) },
+                                ) {
+                                    Text(
+                                        "[$expr]",
+                                        fontFamily = FontFamily.Monospace,
+                                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                    )
+                                }
                             }
                         }
                     }
@@ -275,9 +338,9 @@ fun MemorySearchScreen(onBack: () -> Unit) {
                     }
 
                     Text(
-                        "An address found this way is right for this play session. Some games move " +
-                            "their data each time they start; if a rule stops working after a restart, " +
-                            "that value needs a pointer rule instead.",
+                        "A plain address is right for this play session, but some games move their " +
+                            "data each time they start. \"Find pointer\" looks for a rule that follows " +
+                            "the game to wherever the value is.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -287,12 +350,15 @@ fun MemorySearchScreen(onBack: () -> Unit) {
     }
 }
 
-private fun launchSearch(scope: CoroutineScope, command: String?) {
+private fun launchSearch(scope: CoroutineScope, command: String?) =
+    launchWork(scope) { MemorySearch.execute(command) }
+
+private fun launchWork(scope: CoroutineScope, work: () -> Unit) {
     if (MemorySearch.busy.value) return
     MemorySearch.busy.value = true
     scope.launch {
         try {
-            withContext(Dispatchers.IO) { MemorySearch.execute(command) }
+            withContext(Dispatchers.IO) { work() }
         } finally {
             MemorySearch.busy.value = false
         }

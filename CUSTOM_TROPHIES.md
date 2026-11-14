@@ -97,6 +97,8 @@ the list is short.
 Number types: whole number (`u32`, the usual one), small (`u16`), tiny (`u8`) and decimal
 (`f32`, for things like health bars and timers).
 
-An address found this way is a plain, fixed address. Many games keep their data at the same
-place every run, but some move it; if a rule stops working after restarting the game, that
-value needs a pointer rule (`[[base]+offset]`) instead, which the search cannot find yet.
+An address found this way is right for the current session, but many games put their data
+somewhere new each time they start. **Find pointer** on a result looks for fixed places in
+the game's own data that lead to that address, directly (`[[0xF3F20]+0x48]`) or through one
+more pointer (`[[[0xF3C18]+0x124]+0x1C]`), and lists them likeliest first. A pointer rule
+keeps working after a restart; if the first one does not, try the next.
