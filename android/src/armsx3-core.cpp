@@ -108,6 +108,7 @@
 #include <functional>
 #include <iterator>
 #include <jni.h>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -8798,6 +8799,8 @@ extern "C" void *_armsx3_setCustomDriver(void *driverHandle) {
 // the JNI bridge stays a single function:
 //
 //   new <u8|u16|u32|f32> <value>     start a search for an exact value
+//   new <u8|u16|u32|f32> ?           start a search for an unknown value: remembers
+//                                    all writable memory, to be narrowed by filters
 //   filter eq <value>                keep candidates that now equal <value>
 //   filter <ne|gt|lt|same> [-]       keep candidates that changed / went up /
 //                                    went down / stayed the same since last time
@@ -8817,11 +8820,41 @@ struct MemSearchState {
   bool is_float = false;
   bool truncated = false;
   std::vector<std::pair<u32, u32>> hits; // address, raw value at the last step
+
+  // Unknown-value search: a copy of every writable page plus one "still a candidate" bit
+  // per slot. Turned into `hits` (and freed) as soon as few enough candidates are left.
+  struct Page {
+    u32 addr = 0;
+    u8 data[4096]{};
+    u64 alive[64]{};
+  };
+
+  std::vector<std::unique_ptr<Page>> pages;
+  usz alive_count = 0;
+
+  usz count() const { return pages.empty() ? hits.size() : alive_count; }
+
+  void clear() {
+    hits.clear();
+    hits.shrink_to_fit();
+    pages.clear();
+    pages.shrink_to_fit();
+    alive_count = 0;
+    truncated = false;
+  }
 };
 
 MemSearchState g_mem_search;
 
 constexpr usz mem_search_max_hits = 4'000'000;
+constexpr usz mem_search_max_pages = 384u * 1024 * 1024 / 4096; // unknown-value snapshot limit
+constexpr usz mem_search_convert_at = 1'000'000;                // snapshot -> hit list below this
+
+// Main memory + user memory, then the stack area. Video memory is skipped.
+constexpr std::pair<u32, u32> mem_search_ranges[] = {
+    {0x00010000u, 0x40000000u},
+    {0xD0000000u, 0xE0000000u},
+};
 
 u32 mem_search_raw(const u8 *p, u32 size) {
   if (size == 1) {
@@ -8905,7 +8938,7 @@ bool mem_search_equal(u32 raw, bool is_float, const MemSearchValue &value) {
 }
 
 std::string mem_search_reply(const MemSearchState &state) {
-  return fmt::format("ok %u %d %s", state.hits.size(), state.truncated ? 1 : 0, state.type.empty() ? "-" : state.type);
+  return fmt::format("ok %u %d %s", state.count(), state.truncated ? 1 : 0, state.type.empty() ? "-" : state.type);
 }
 } // namespace
 
@@ -8921,15 +8954,13 @@ extern "C" std::string _armsx3_memSearch(std::string_view command) {
 
   if (args[0] == "reset") {
     state.type.clear();
-    state.hits.clear();
-    state.hits.shrink_to_fit();
-    state.truncated = false;
+    state.clear();
     return mem_search_reply(state);
   }
 
   if (Emu.IsStopped()) {
     state.type.clear();
-    state.hits.clear();
+    state.clear();
     return "err no game is running";
   }
 
@@ -8953,27 +8984,55 @@ extern "C" std::string _armsx3_memSearch(std::string_view command) {
       return "err unknown type";
     }
 
-    const MemSearchValue value = mem_search_parse(args[2], size, is_float);
+    const bool unknown = args[2] == "?";
+    const MemSearchValue value = unknown ? MemSearchValue{} : mem_search_parse(args[2], size, is_float);
 
-    if (!value.valid) {
+    if (!unknown && !value.valid) {
       return "err not a number";
     }
 
     state.type = args[1];
     state.size = size;
     state.is_float = is_float;
-    state.truncated = false;
-    state.hits.clear();
+    state.clear();
 
-    // Main memory + user memory, then the stack area. Video memory is skipped.
-    static constexpr std::pair<u32, u32> s_ranges[] = {
-        {0x00010000u, 0x40000000u},
-        {0xD0000000u, 0xE0000000u},
-    };
+    if (unknown) {
+      // Remember everything the game can write to; code and constants cannot be counters
+      const u32 slots = 4096 / size;
+
+      for (const auto &[begin, end] : mem_search_ranges) {
+        for (u32 addr = begin; addr < end; addr += 4096) {
+          if (!vm::check_addr(addr, vm::page_readable | vm::page_writable, 4096)) {
+            continue;
+          }
+
+          if (state.pages.size() >= mem_search_max_pages) {
+            state.truncated = true;
+            break;
+          }
+
+          auto page = std::make_unique<MemSearchState::Page>();
+          page->addr = addr;
+
+          if (!vm::try_access(addr, page->data, 4096, false)) {
+            continue;
+          }
+
+          for (u32 slot = 0; slot < slots; slot++) {
+            page->alive[slot / 64] |= u64{1} << (slot % 64);
+          }
+
+          state.alive_count += slots;
+          state.pages.emplace_back(std::move(page));
+        }
+      }
+
+      return mem_search_reply(state);
+    }
 
     std::vector<u8> page(4096);
 
-    for (const auto &[begin, end] : s_ranges) {
+    for (const auto &[begin, end] : mem_search_ranges) {
       for (u32 addr = begin; addr < end && !state.truncated; addr += 4096) {
         if (!vm::check_addr(addr, vm::page_readable, 4096) || !vm::try_access(addr, page.data(), 4096, false)) {
           continue;
@@ -9019,6 +9078,87 @@ extern "C" std::string _armsx3_memSearch(std::string_view command) {
       return "err unknown filter";
     }
 
+    const auto keeps = [&](u32 raw, u32 old_raw) {
+      if (op == "eq") {
+        return mem_search_equal(raw, state.is_float, value);
+      }
+
+      if (op == "ne") {
+        return raw != old_raw;
+      }
+
+      if (op == "same") {
+        return raw == old_raw;
+      }
+
+      const double now = mem_search_number(raw, state.is_float);
+      const double before = mem_search_number(old_raw, state.is_float);
+
+      // NaN compares false both ways, so junk floats drop out
+      return op == "gt" ? now > before : now < before;
+    };
+
+    if (!state.pages.empty()) {
+      const u32 slots = 4096 / state.size;
+      std::vector<u8> fresh(4096);
+      usz alive = 0;
+
+      for (auto &page : state.pages) {
+        if (!vm::try_access(page->addr, fresh.data(), 4096, false)) {
+          std::memset(page->alive, 0, sizeof(page->alive));
+          continue;
+        }
+
+        for (u32 slot = 0; slot < slots; slot++) {
+          u64 &word = page->alive[slot / 64];
+          const u64 bit = u64{1} << (slot % 64);
+
+          if (!(word & bit)) {
+            // Skip whole empty words quickly
+            if (!word) {
+              slot |= 63;
+            }
+
+            continue;
+          }
+
+          const u32 off = slot * state.size;
+
+          if (keeps(mem_search_raw(fresh.data() + off, state.size), mem_search_raw(page->data + off, state.size))) {
+            alive++;
+          } else {
+            word &= ~bit;
+          }
+        }
+
+        std::memcpy(page->data, fresh.data(), 4096);
+      }
+
+      state.alive_count = alive;
+
+      if (alive <= mem_search_convert_at) {
+        // Few enough left: switch to the compact list and free the snapshot
+        state.hits.clear();
+        state.hits.reserve(alive);
+
+        for (const auto &page : state.pages) {
+          for (u32 slot = 0; slot < slots; slot++) {
+            if (page->alive[slot / 64] & (u64{1} << (slot % 64))) {
+              const u32 off = slot * state.size;
+              state.hits.emplace_back(page->addr + off, mem_search_raw(page->data + off, state.size));
+            }
+          }
+        }
+
+        state.pages.clear();
+        state.pages.shrink_to_fit();
+        state.alive_count = 0;
+        state.truncated = false;
+      }
+
+      return mem_search_reply(state);
+    }
+
     std::vector<std::pair<u32, u32>> kept;
     kept.reserve(state.hits.size() / 4);
 
@@ -9030,23 +9170,8 @@ extern "C" std::string _armsx3_memSearch(std::string_view command) {
       }
 
       const u32 raw = mem_search_raw(buf, state.size);
-      const double now = mem_search_number(raw, state.is_float);
-      const double before = mem_search_number(old_raw, state.is_float);
-      bool keep = false;
 
-      if (op == "eq") {
-        keep = mem_search_equal(raw, state.is_float, value);
-      } else if (op == "ne") {
-        keep = raw != old_raw;
-      } else if (op == "same") {
-        keep = raw == old_raw;
-      } else if (op == "gt") {
-        keep = now > before;
-      } else {
-        keep = now < before;
-      }
-
-      if (keep) {
+      if (keeps(raw, old_raw)) {
         kept.emplace_back(addr, raw);
       }
     }
@@ -9063,6 +9188,11 @@ extern "C" std::string _armsx3_memSearch(std::string_view command) {
     }
 
     std::string out = mem_search_reply(state);
+
+    if (!state.pages.empty()) {
+      // Still too many to be worth listing one by one
+      return out;
+    }
 
     for (usz i = 0; i < state.hits.size() && i < max; i++) {
       u8 buf[4]{};

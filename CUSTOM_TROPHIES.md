@@ -88,6 +88,12 @@ number you can see in the game:
    "stayed the same". Repeat until only a few addresses are left.
 4. Tap a result to copy a rule line such as `when: "[0x1A2B3C] >= 13"` for the rules file.
 
+For a value the game never shows (a hidden "blocks destroyed" count), tap **I don't know the
+number** instead of searching. The emulator remembers all of the game's memory; then do the
+thing in the game and filter "went up", wait and filter "stayed the same", and keep
+alternating until a list of addresses appears. This uses a few hundred MB of memory until
+the list is short.
+
 Number types: whole number (`u32`, the usual one), small (`u16`), tiny (`u8`) and decimal
 (`f32`, for things like health bars and timers).
 

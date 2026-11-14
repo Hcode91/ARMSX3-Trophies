@@ -143,7 +143,8 @@ fun MemorySearchScreen(onBack: () -> Unit) {
             ) {
                 Text(
                     if (!active) {
-                        "1. Type a number you can see in the game (coins, lives, score) and search.\n" +
+                        "1. Type a number you can see in the game (coins, lives, score) and search. " +
+                            "For a hidden count, tap \"I don't know the number\" instead.\n" +
                             "2. Go back to the game and change that number.\n" +
                             "3. Come back here and filter. Repeat until only a few are left."
                     } else {
@@ -183,6 +184,13 @@ fun MemorySearchScreen(onBack: () -> Unit) {
                         enabled = !busy && typed.isNotEmpty(),
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Search") }
+
+                    // For values the game never shows, like a hidden "blocks destroyed" count.
+                    OutlinedButton(
+                        onClick = { run("new ${MemorySearch.type.value} ?") },
+                        enabled = !busy,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("I don't know the number") }
                 } else {
                     Button(
                         onClick = { run("filter eq $typed") },
@@ -217,7 +225,13 @@ fun MemorySearchScreen(onBack: () -> Unit) {
                     val hits = MemorySearch.hits.value
                     if (hits.isEmpty()) {
                         Text(
-                            "Nothing left. Start over, and try a different number type if it keeps happening.",
+                            if (count > 0) {
+                                "Too many to list yet. Do the thing in the game (break a block), then tap " +
+                                    "\"Went up\". Do nothing for a moment, then tap \"Stayed the same\". " +
+                                    "Keep alternating until the list appears."
+                            } else {
+                                "Nothing left. Start over, and try a different number type if it keeps happening."
+                            },
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
