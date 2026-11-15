@@ -1,0 +1,129 @@
+# Custom trophies for NPWR03105_00 (Arkedo Series)
+# Counters in this game stop at the official trophy targets (200 blocks, 1,000 kills,
+# 1,000 treasures...), so these milestones sit below them.
+game: PPU-becb727cee674b3b8ce10f8457f61b00a60cb20f
+custom:
+  - name: "CUSTOM - PIXEL! - Chip off the block"
+    detail: "Destroy 25 breakable blocks."
+    grade: B
+    icon: arkedo_00.png
+    when: "[[0xF3F20]+0x48] >= 25"
+  - name: "CUSTOM - PIXEL! - Wrecking paw"
+    detail: "Destroy 100 breakable blocks."
+    grade: B
+    icon: arkedo_01.png
+    when: "[[0xF3F20]+0x48] >= 100"
+  - name: "CUSTOM - PIXEL! - First scratch"
+    detail: "Kill 10 foes."
+    grade: B
+    icon: arkedo_02.png
+    when: "[[0xF3F20]+0x24] >= 10"
+  - name: "CUSTOM - PIXEL! - Prowler"
+    detail: "Kill 100 foes."
+    grade: B
+    icon: arkedo_03.png
+    when: "[[0xF3F20]+0x24] >= 100"
+  - name: "CUSTOM - PIXEL! - Apex kitty"
+    detail: "Kill 500 foes."
+    grade: S
+    icon: arkedo_04.png
+    when: "[[0xF3F20]+0x24] >= 500"
+  - name: "CUSTOM - PIXEL! - Rampage"
+    detail: "Kill 30 foes in one sitting."
+    grade: S
+    icon: arkedo_05.png
+    when: "delta([[0xF3F20]+0x24]) >= 30"
+  - name: "CUSTOM - PIXEL! - Curio"
+    detail: "Collect a Useless Relic."
+    grade: B
+    icon: arkedo_06.png
+    when: "(u8[[0xF3F20]+0xb] > 0) + (u8[[0xF3F20]+0xc] > 0) + (u8[[0xF3F20]+0xd] > 0) + (u8[[0xF3F20]+0xe] > 0) + (u8[[0xF3F20]+0xf] > 0) + (u8[[0xF3F20]+0x10] > 0) + (u8[[0xF3F20]+0x11] > 0) + (u8[[0xF3F20]+0x12] > 0) + (u8[[0xF3F20]+0x13] > 0) + (u8[[0xF3F20]+0x14] > 0) + (u8[[0xF3F20]+0x15] > 0) + (u8[[0xF3F20]+0x16] > 0) + (u8[[0xF3F20]+0x17] > 0) + (u8[[0xF3F20]+0x18] > 0) + (u8[[0xF3F20]+0x19] > 0) + (u8[[0xF3F20]+0x1a] > 0) + (u8[[0xF3F20]+0x1b] > 0) + (u8[[0xF3F20]+0x1c] > 0) >= 1"
+  - name: "CUSTOM - PIXEL! - Hoarder"
+    detail: "Collect 9 Useless Relics."
+    grade: S
+    icon: arkedo_07.png
+    when: "(u8[[0xF3F20]+0xb] > 0) + (u8[[0xF3F20]+0xc] > 0) + (u8[[0xF3F20]+0xd] > 0) + (u8[[0xF3F20]+0xe] > 0) + (u8[[0xF3F20]+0xf] > 0) + (u8[[0xF3F20]+0x10] > 0) + (u8[[0xF3F20]+0x11] > 0) + (u8[[0xF3F20]+0x12] > 0) + (u8[[0xF3F20]+0x13] > 0) + (u8[[0xF3F20]+0x14] > 0) + (u8[[0xF3F20]+0x15] > 0) + (u8[[0xF3F20]+0x16] > 0) + (u8[[0xF3F20]+0x17] > 0) + (u8[[0xF3F20]+0x18] > 0) + (u8[[0xF3F20]+0x19] > 0) + (u8[[0xF3F20]+0x1a] > 0) + (u8[[0xF3F20]+0x1b] > 0) + (u8[[0xF3F20]+0x1c] > 0) >= 9"
+  - name: "CUSTOM - PIXEL! - Secret arcade"
+    detail: "Find a hidden pixel mini-game."
+    grade: B
+    icon: arkedo_08.png
+    when: "u16[[0xF3F20]+0x3a] + u16[[0xF3F20]+0x3c] + u16[[0xF3F20]+0x3e] + u16[[0xF3F20]+0x40] + u16[[0xF3F20]+0x42] + u16[[0xF3F20]+0x44] + u16[[0xF3F20]+0x46] > 0"
+  - name: "CUSTOM - PIXEL! - Spring heels"
+    detail: "Jump 100 times."
+    grade: B
+    icon: arkedo_09.png
+    when: "count((f32[[[0x1f6a00]+0xf4]+0x24] > 0) * u8[[[0x1f6a00]+0xf4]+0x21]) >= 100"
+  - name: "CUSTOM - PIXEL! - Bouncy castle"
+    detail: "Jump 1,000 times."
+    grade: S
+    icon: arkedo_10.png
+    when: "count((f32[[[0x1f6a00]+0xf4]+0x24] > 0) * u8[[[0x1f6a00]+0xf4]+0x21]) >= 1000"
+  - name: "CUSTOM - PIXEL! - Eight lives left"
+    detail: "Take damage for the first time."
+    grade: B
+    icon: arkedo_11.png
+    when: "u16[[[0x1f6a00]+0xf4]+0x4] < prev(u16[[[0x1f6a00]+0xf4]+0x4]) || u16[[[0x1f6a00]+0xf4]+0x6] < prev(u16[[[0x1f6a00]+0xf4]+0x6])"
+  - name: "CUSTOM - PIXEL! - Pounce"
+    detail: "Chain 3 stomps without touching the ground."
+    grade: B
+    icon: arkedo_12.png
+    when: "u16[[[0x1f6a00]+0xf4]+0xa] >= 3"
+  - name: "CUSTOM - PIXEL! - Chain reaction"
+    detail: "Chain 5 stomps without touching the ground."
+    grade: S
+    icon: arkedo_13.png
+    when: "u16[[[0x1f6a00]+0xf4]+0xa] >= 5"
+  - name: "CUSTOM - PIXEL! - Untouchable"
+    detail: "Stay at full health for 3 minutes of play."
+    grade: S
+    icon: arkedo_14.png
+    when: "u16[[[0x1f6a00]+0xf4]+0x4] >= 6 && u16[[[0x1f6a00]+0xf4]+0x6] >= 6 for 180s"
+  - name: "CUSTOM - JUMP! - Sharp"
+    detail: "Kill 5 foes with the knife."
+    grade: B
+    icon: arkedo_15.png
+    when: "[[[[0xF3C18]+0x124]+0x74]+0x44] >= 5"
+  - name: "CUSTOM - JUMP! - Knife thrower"
+    detail: "Kill 15 foes with the knife."
+    grade: B
+    icon: arkedo_16.png
+    when: "[[[[0xF3C18]+0x124]+0x74]+0x44] >= 15"
+  - name: "CUSTOM - JUMP! - Careful steps"
+    detail: "Achieve 3 levels without dying."
+    grade: B
+    icon: arkedo_17.png
+    when: "[[[0xF3C18]+0x124]+0x1c] >= 3"
+  - name: "CUSTOM - JUMP! - Steady hands"
+    detail: "Achieve 6 levels without dying."
+    grade: S
+    icon: arkedo_18.png
+    when: "[[[0xF3C18]+0x124]+0x1c] >= 6"
+  - name: "CUSTOM - JUMP! - Challenger"
+    detail: "Complete a challenge."
+    grade: B
+    icon: arkedo_19.png
+    when: "(u8[[[[0xF3C18]+0x124]+0x74]+0x1f] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x20] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x21] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x22] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x23] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x24] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x25] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x26] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x27] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x28] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x29] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x2a] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x2b] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x2c] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x2d] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x2e] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x2f] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x30] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x31] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x32] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x33] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x34] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x35] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x36] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x37] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x38] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x39] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x3a] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x3b] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x3c] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x3d] > 0) >= 1"
+  - name: "CUSTOM - JUMP! - Halfway up"
+    detail: "Complete 15 challenges."
+    grade: S
+    icon: arkedo_20.png
+    when: "(u8[[[[0xF3C18]+0x124]+0x74]+0x1f] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x20] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x21] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x22] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x23] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x24] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x25] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x26] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x27] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x28] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x29] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x2a] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x2b] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x2c] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x2d] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x2e] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x2f] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x30] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x31] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x32] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x33] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x34] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x35] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x36] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x37] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x38] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x39] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x3a] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x3b] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x3c] > 0) + (u8[[[[0xF3C18]+0x124]+0x74]+0x3d] > 0) >= 15"
+  - name: "CUSTOM - SWAP! - Pocket money"
+    detail: "Collect 100 treasures."
+    grade: B
+    icon: arkedo_21.png
+    when: "[[0xF3F04]+0x30] >= 100"
+  - name: "CUSTOM - SWAP! - Nest egg"
+    detail: "Collect 500 treasures."
+    grade: S
+    icon: arkedo_22.png
+    when: "[[0xF3F04]+0x30] >= 500"
+  - name: "CUSTOM - All-rounder"
+    detail: "Earn a custom trophy in each of the three games."
+    grade: G
+    icon: arkedo_23.png
+    when: "trophy(16) == 1 && trophy(29) == 1 && trophy(35) == 1"
+  - name: "CUSTOM - Arkedo completionist"
+    detail: "Unlock every other trophy."
+    grade: P
+    icon: arkedo_24.png

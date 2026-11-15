@@ -58,6 +58,19 @@ A custom trophy's number is its position in the list, so never remove or reorder
 hand: that would move earned progress onto the wrong trophies. To get rid of one, add
 `deleted: true` to it. It keeps its place, but is hidden and can no longer be earned.
 
+**Platinum.** A custom trophy with `grade: P` needs no rule: it is earned when every other
+trophy in the set (official and custom, not counting removed ones) is unlocked. Only for sets
+that do not have a platinum already, and only one per set.
+
+**Problems.** If something in the file cannot be used (a rule that cannot be understood, a
+file made for another game version), the emulator writes what and why to
+`trophy_rules/<NPWRxxxxx_00>_problems.txt` and the memory search screen shows it.
+
+**Testing.** *Reset* locks a custom trophy again and clears its rule's progress, so a rule can
+be tried over and over, ideally from a savestate made just before the moment it is about.
+Changing rules and loading a savestate picks the new rules up; confirm pointer rules with a
+real restart, since a savestate restores memory exactly as it was.
+
 The memory search screen does all of this for you: **Create trophy** (tap a result), a list of
 the game's custom trophies with **Edit** and **Delete**, and **Export pack** / **Import pack**,
 which save or install the rules file together with its icons as one zip.

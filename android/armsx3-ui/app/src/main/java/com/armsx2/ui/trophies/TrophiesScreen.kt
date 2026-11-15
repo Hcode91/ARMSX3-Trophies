@@ -3,6 +3,7 @@ package com.armsx2.ui.trophies
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -112,6 +113,51 @@ fun TrophiesScreen(
                 Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
+                // Custom trophy packs (ARMSX3-Trophies): install or back up packs without having to
+                // start a game. A pack is a zip of rules files and icons, see CUSTOM_TROPHIES.md.
+                if (!currentGameOnly) {
+                    val packContext = androidx.compose.ui.platform.LocalContext.current
+                    val packScope = androidx.compose.runtime.rememberCoroutineScope()
+                    val packMessage = androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf("") }
+                    val importPack = androidx.activity.compose.rememberLauncherForActivityResult(
+                        androidx.activity.result.contract.ActivityResultContracts.GetContent(),
+                    ) { uri ->
+                        if (uri != null) {
+                            packScope.launch {
+                                packMessage.value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                    MemorySearch.importPack(packContext, uri)
+                                }
+                            }
+                        }
+                    }
+                    val exportPacks = androidx.activity.compose.rememberLauncherForActivityResult(
+                        androidx.activity.result.contract.ActivityResultContracts.CreateDocument("application/zip"),
+                    ) { uri ->
+                        if (uri != null) {
+                            packScope.launch {
+                                packMessage.value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                    MemorySearch.exportPack(packContext, uri, everyGame = true)
+                                }
+                            }
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        androidx.compose.material3.OutlinedButton(onClick = { importPack.launch("*/*") }) {
+                            Text("Import custom trophy pack")
+                        }
+                        androidx.compose.material3.OutlinedButton(onClick = { exportPacks.launch("custom-trophy-packs.zip") }) {
+                            Text("Export all packs")
+                        }
+                    }
+                    if (packMessage.value.isNotEmpty()) {
+                        Text(
+                            packMessage.value,
+                            style = androidx.compose.material3.MaterialTheme.typography.bodySmall,
+                            color = androidx.compose.material3.MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                }
+
                 if (state.games.isNotEmpty()) {
                     SettingSwitchRow(
                         title = str("trophies.showHidden"),

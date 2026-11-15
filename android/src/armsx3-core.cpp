@@ -8808,6 +8808,7 @@ extern "C" void *_armsx3_setCustomDriver(void *driverHandle) {
 //   reset                            drop the search
 //   info                             "ok <PPU hash of the running game>"
 //   eval <expression>                current value of a rule expression, "ok <value>"
+//   resetcustom <index>              lock a custom trophy again and clear its rule progress
 //   filter <inc|dec> <n>             keep candidates that went up / down by exactly n
 //   pointer <hex addr>               find fixed places that point at (or just before)
 //                                    an address, directly or through up to two more pointers.
@@ -8974,6 +8975,16 @@ extern "C" std::string _armsx3_memSearch(std::string_view command) {
   if (args[0] == "info") {
     // The executable's hash, which a rules file names so it only runs on this game version
     return "ok " + Emu.GetExecutableHash();
+  }
+
+  if (args[0] == "resetcustom") {
+    // Lock custom trophy number <index in the rules file> again, for testing its rule
+    if (args.size() < 2) {
+      return "err usage: resetcustom <index>";
+    }
+
+    const u32 index = static_cast<u32>(std::strtoul(args[1].c_str(), nullptr, 10));
+    return sceNpTrophy_reset_custom(index) ? "ok" : "err that trophy is not loaded in the running game";
   }
 
   if (args[0] == "eval") {

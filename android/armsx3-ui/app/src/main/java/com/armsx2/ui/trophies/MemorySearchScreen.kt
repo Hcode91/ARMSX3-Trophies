@@ -41,6 +41,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import com.armsx2.ui.settings.controllerFocusable
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.layout.offset
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.runtime.LaunchedEffect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -154,6 +157,9 @@ object MemorySearch {
     val watchValues = mutableStateOf<Map<String, String>>(emptyMap())
     /** Show the watch list (and the filter buttons) over the running game. */
     val overlay = mutableStateOf(false)
+    /** Where the overlay was dragged to, in pixels from the top-left corner. */
+    val overlayX = mutableStateOf(0f)
+    val overlayY = mutableStateOf(0f)
     private var watchSet = ""
 
     private fun watchFile(): File? {
@@ -340,8 +346,24 @@ object MemorySearch {
         pack.file.writeText((pack.header + pack.entries.flatMap { it.lines }).joinToString("\n") + "\n")
     }
 
+    /** What the core could not understand in this game's rules file the last time it loaded
+     *  it (trophy_rules/<set>_problems.txt), one problem per line. */
+    val problems = mutableStateOf<List<String>>(emptyList())
+
+    /** Locks a custom trophy again and clears its rule's progress, so its rule can be tested
+     *  again. Blocking. Returns an error message, or null. */
+    fun resetCustom(index: Int): String? {
+        val reply = call("resetcustom $index")
+        return if (reply.startsWith("ok")) null else reply.removePrefix("err").trim()
+    }
+
     /** Re-reads the list of this game's custom trophies. Blocking. */
     fun refreshCustom() {
+        problems.value = runCatching {
+            val set = currentSet()
+            if (set.isEmpty()) emptyList()
+            else File(rulesDir(), "${set}_problems.txt").takeIf { it.isFile }?.readLines().orEmpty().filter { it.isNotBlank() }
+        }.getOrDefault(emptyList())
         customList.value = runCatching {
             readPack()?.entries.orEmpty().withIndex().filter { !it.value.deleted }.map { it.index to it.value }
         }.getOrDefault(emptyList())
@@ -353,7 +375,7 @@ object MemorySearch {
         editing.value = index
         draftName.value = entry.name
         draftDetail.value = entry.get("detail").orEmpty()
-        draftGrade.value = entry.get("grade")?.take(1)?.uppercase()?.takeIf { it in listOf("B", "S", "G") } ?: "B"
+        draftGrade.value = entry.get("grade")?.take(1)?.uppercase()?.takeIf { it in listOf("B", "S", "G", "P") } ?: "B"
     }
 
     /**
@@ -396,13 +418,18 @@ object MemorySearch {
         val name = draftName.value.trim()
         val editIndex = editing.value
         if (name.isEmpty()) return "Give the trophy a name."
-        if (rule.isEmpty() && editIndex == null) return "The rule is empty."
+        val platinum = draftGrade.value == "P"
+        if (rule.isEmpty() && editIndex == null && !platinum) return "The rule is empty."
 
         val set = currentSet()
         if (set.isEmpty()) return "This game has not set up its trophies yet. Play until it has, then try again."
 
         return runCatching<String?> {
             val pack = readPack() ?: return@runCatching "No game is running."
+
+            if (platinum && pack.entries.withIndex().any { it.index != editIndex && !it.value.deleted && it.value.get("grade")?.startsWith("P", ignoreCase = true) == true }) {
+                return@runCatching "This game already has a custom platinum."
+            }
 
             var iconName: String? = null
             draftIcon.value?.let { uri ->
@@ -428,7 +455,8 @@ object MemorySearch {
             iconName?.let { entry.set("icon", it) }
             // An empty rule box on an edit leaves the existing rule (which may be a sequence
             // this form cannot show) exactly as it is.
-            if (rule.isNotEmpty()) entry.set("when", quote(rule))
+            // A platinum has no rule of its own: it is earned by unlocking everything else.
+            if (rule.isNotEmpty() && !platinum) entry.set("when", quote(rule))
 
             writePack(pack)
             editing.value = null
@@ -438,25 +466,34 @@ object MemorySearch {
     }
 
     /** Writes the running game's pack (rules file + icons) as a zip to [target]. Blocking. */
-    fun exportPack(context: Context, target: Uri): String = runCatching {
-        val set = currentSet()
-        if (set.isEmpty()) return@runCatching "No game is running."
-        val yml = File(rulesDir(), "$set.yml")
-        if (!yml.isFile) return@runCatching "This game has no custom trophies yet."
+    fun exportPack(context: Context, target: Uri, everyGame: Boolean = false): String = runCatching {
+        val setName = Regex("^NPWR\\d{5}_\\d{2}$")
+        val sets = if (everyGame) {
+            rulesDir().listFiles().orEmpty()
+                .filter { it.isFile && it.name.endsWith(".yml") && setName.matches(it.name.removeSuffix(".yml")) }
+                .map { it.name.removeSuffix(".yml") }.sorted()
+        } else {
+            val set = currentSet()
+            if (set.isEmpty()) return@runCatching "No game is running."
+            listOf(set).filter { File(rulesDir(), "$it.yml").isFile }
+        }
+        if (sets.isEmpty()) return@runCatching if (everyGame) "There are no custom trophy packs yet." else "This game has no custom trophies yet."
         val out = context.contentResolver.openOutputStream(target) ?: return@runCatching "Could not write to that location."
         java.util.zip.ZipOutputStream(out).use { zip ->
-            zip.putNextEntry(java.util.zip.ZipEntry("$set.yml"))
-            zip.write(yml.readBytes())
-            zip.closeEntry()
-            File(rulesDir(), set).listFiles().orEmpty()
-                .filter { it.isFile && it.name.endsWith(".png", ignoreCase = true) }
-                .forEach { icon ->
-                    zip.putNextEntry(java.util.zip.ZipEntry("$set/${icon.name}"))
-                    zip.write(icon.readBytes())
-                    zip.closeEntry()
-                }
+            for (set in sets) {
+                zip.putNextEntry(java.util.zip.ZipEntry("$set.yml"))
+                zip.write(File(rulesDir(), "$set.yml").readBytes())
+                zip.closeEntry()
+                File(rulesDir(), set).listFiles().orEmpty()
+                    .filter { it.isFile && it.name.endsWith(".png", ignoreCase = true) }
+                    .forEach { icon ->
+                        zip.putNextEntry(java.util.zip.ZipEntry("$set/${icon.name}"))
+                        zip.write(icon.readBytes())
+                        zip.closeEntry()
+                    }
+            }
         }
-        "Pack exported."
+        if (sets.size == 1) "Pack exported." else "${sets.size} packs exported."
     }.getOrElse { "Could not export the pack: ${it.message}" }
 
     /**
@@ -580,17 +617,41 @@ fun MemorySearchScreen(onBack: () -> Unit) {
                         label = { Text("Description") },
                         modifier = Modifier.fillMaxWidth(),
                     )
-                    OutlinedTextField(
-                        value = draft,
-                        onValueChange = { MemorySearch.draftRule.value = it },
-                        label = { Text("Earned when (change the number at the end to your target)") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         GradeButton("B", "Bronze")
                         GradeButton("S", "Silver")
                         GradeButton("G", "Gold")
+                    }
+                    GradeButton("P", "Platinum - earned by unlocking every other trophy")
+                    if (MemorySearch.draftGrade.value != "P") {
+                        OutlinedTextField(
+                            value = draft,
+                            onValueChange = { MemorySearch.draftRule.value = it },
+                            label = { Text("Earned when (change the number at the end to your target)") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        // Shortcuts that rewrite the rule around the value it watches
+                        val watched = MemorySearch.exprOf(MemorySearch.cleanRule(draft))
+                        if (watched.isNotEmpty() && !watched.startsWith("delta(") && !watched.startsWith("count(")) {
+                            Text(
+                                "Make it about…",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                OutlinedButton(onClick = { MemorySearch.draftRule.value = "delta($watched) >= 10" }) { Text("This session only") }
+                                OutlinedButton(onClick = { MemorySearch.draftRule.value = "$watched < prev($watched)" }) { Text("It going down") }
+                            }
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                OutlinedButton(onClick = { MemorySearch.draftRule.value = "$watched > prev($watched)" }) { Text("It going up") }
+                                OutlinedButton(onClick = { MemorySearch.draftRule.value = "count($watched > 0) >= 10" }) { Text("How many times") }
+                            }
+                        }
+                        val plain = MemorySearch.cleanRule(draft)
+                        if (plain.isNotEmpty() && " for " !in plain && "||" !in plain && "&&" !in plain) {
+                            OutlinedButton(onClick = { MemorySearch.draftRule.value = "$plain for 30s" }) { Text("Has to stay true for 30 seconds") }
+                        }
                     }
                     OutlinedButton(onClick = { pickIcon.launch("image/*") }, modifier = Modifier.fillMaxWidth()) {
                         Text(if (MemorySearch.draftIcon.value == null) "Pick an icon (optional)" else "Icon picked - tap to change")
@@ -633,6 +694,26 @@ fun MemorySearchScreen(onBack: () -> Unit) {
                 Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
+                val problems = MemorySearch.problems.value
+                if (problems.isNotEmpty()) {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text(
+                                "Problems in this game's trophy rules (as of the last time the game started):",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                            )
+                            problems.take(8).forEach {
+                                Text("• $it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onErrorContainer)
+                            }
+                        }
+                    }
+                }
+
                 val created = MemorySearch.created.value
                 if (created.isNotEmpty()) {
                     Text(created, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
@@ -739,6 +820,16 @@ fun MemorySearchScreen(onBack: () -> Unit) {
                                 verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
                             ) {
                                 Text(entry.name, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f))
+                                OutlinedButton(
+                                    onClick = {
+                                        launchWork(scope) {
+                                            val error = MemorySearch.resetCustom(index)
+                                            MemorySearch.created.value = if (error == null) "\"${entry.name}\" is locked again." else ""
+                                            MemorySearch.message.value = error.orEmpty()
+                                        }
+                                    },
+                                    enabled = !busy,
+                                ) { Text("Reset") }
                                 OutlinedButton(onClick = { MemorySearch.openEdit(index, entry) }) { Text("Edit") }
                                 OutlinedButton(
                                     onClick = {
@@ -987,7 +1078,16 @@ fun MemoryWatchOverlay() {
 
     Column(
         Modifier
+            .offset { androidx.compose.ui.unit.IntOffset(MemorySearch.overlayX.value.toInt(), MemorySearch.overlayY.value.toInt()) }
             .padding(start = 8.dp, top = 8.dp)
+            // Drag the panel anywhere on the screen
+            .pointerInput(Unit) {
+                detectDragGestures { change, drag ->
+                    change.consume()
+                    MemorySearch.overlayX.value = (MemorySearch.overlayX.value + drag.x).coerceAtLeast(0f)
+                    MemorySearch.overlayY.value = (MemorySearch.overlayY.value + drag.y).coerceAtLeast(0f)
+                }
+            }
             .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
             .padding(horizontal = 8.dp, vertical = 6.dp),
         verticalArrangement = Arrangement.spacedBy(2.dp),

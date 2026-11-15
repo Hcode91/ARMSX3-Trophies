@@ -322,6 +322,22 @@ static void show_trophy_notification(const trophy_context_t* ctxt, s32 trophyId)
 // Without a rules file nothing here changes any behaviour.
 // ---------------------------------------------------------------------------------------
 
+// Problems found while loading a rules file. They go to the log and, so that they can be
+// shown in the app instead of trophies silently going missing, to
+// trophy_rules/<NPWRxxxxx_00>_problems.txt.
+static std::vector<std::string>* s_ct_problems = nullptr;
+
+#define CT_PROBLEM(...) \
+	do \
+	{ \
+		std::string ct_problem_text = fmt::format(__VA_ARGS__); \
+		sceNpTrophy.error("Custom trophy rules: %s", ct_problem_text); \
+		if (s_ct_problems) \
+		{ \
+			s_ct_problems->emplace_back(std::move(ct_problem_text)); \
+		} \
+	} while (0)
+
 enum ct_op_type : u8
 {
 	ct_push,
@@ -392,6 +408,7 @@ struct ct_rule
 
 	// State
 	u32 current = 0;
+	bool all_others = false;   // custom platinum: earned when every other trophy is
 	bool has_progress = false; // simple "value >= target" rules can show progress
 	f64 progress_target = 0;
 	s64 progress_shown = -1;
@@ -419,6 +436,7 @@ struct ct_rules_set
 {
 	std::vector<ct_custom_trophy> custom;
 	u32 defined_trophies = 0; // official + custom, 0 if unknown
+	bool resize_tried = false;
 	u64 last_check = 0;
 	u64 next_progress_write = 0;
 	bool progress_dirty = false;
@@ -1310,7 +1328,7 @@ static void ct_add_clause(ct_step& step, s32 id, const std::string& text, bool& 
 
 			if (!ct_parse_condition(part, cond))
 			{
-				sceNpTrophy.error("Custom trophy rules: trophy %d: cannot understand condition '%s'", id, part);
+				CT_PROBLEM("trophy %d: cannot understand condition '%s'", id, part);
 				valid = false;
 				return;
 			}
@@ -1476,7 +1494,7 @@ static void ct_load(ct_rules_set& set, const std::string& trp_name)
 
 	if (!loaded.second.empty() || !root.IsMap())
 	{
-		sceNpTrophy.error("Custom trophy rules: failed to read '%s': %s", used_path, loaded.second);
+		CT_PROBLEM("failed to read '%s': %s", used_path, loaded.second);
 		return;
 	}
 
@@ -1512,7 +1530,7 @@ static void ct_load(ct_rules_set& set, const std::string& trp_name)
 
 		if (!wanted.empty() && wanted != actual)
 		{
-			sceNpTrophy.error("Custom trophy rules: '%s' is for %s but this game is %s. Memory rules are disabled.", used_path, wanted, actual);
+			CT_PROBLEM("'%s' is for %s but this game is %s. Memory rules are disabled.", used_path, wanted, actual);
 			rules_allowed = false;
 		}
 	}
@@ -1525,7 +1543,7 @@ static void ct_load(ct_rules_set& set, const std::string& trp_name)
 
 			if (!entry.first.IsScalar() || !ct_parse_int(entry.first.Scalar(), rule.id))
 			{
-				sceNpTrophy.error("Custom trophy rules: bad trophy id in '%s'", used_path);
+				CT_PROBLEM("bad trophy id in '%s'", used_path);
 				continue;
 			}
 
@@ -1569,7 +1587,7 @@ static void ct_load(ct_rules_set& set, const std::string& trp_name)
 			if (const YAML::Node n = value["grade"]; n && n.IsScalar() && !n.Scalar().empty())
 			{
 				const char grade = n.Scalar()[0];
-				trophy.grade = (grade == 'G' || grade == 'g') ? 'G' : (grade == 'S' || grade == 's') ? 'S' : 'B';
+				trophy.grade = (grade == 'P' || grade == 'p') ? 'P' : (grade == 'G' || grade == 'g') ? 'G' : (grade == 'S' || grade == 's') ? 'S' : 'B';
 			}
 
 			if (const YAML::Node n = value["hidden"]; n && n.IsScalar())
@@ -1589,16 +1607,18 @@ static void ct_load(ct_rules_set& set, const std::string& trp_name)
 
 			if (trophy.name.empty())
 			{
-				sceNpTrophy.error("Custom trophy rules: a custom trophy in '%s' has no name, skipping", used_path);
+				CT_PROBLEM("a custom trophy in '%s' has no name, skipping", used_path);
 				continue;
 			}
 
-			if (trophy.deleted)
+			if (trophy.deleted || trophy.grade == 'P')
 			{
-				// No rule: it only holds its place
+				// No rule to read: a deleted trophy only holds its place, and a platinum is
+				// earned by unlocking every other trophy
 			}
 			else if (rules_allowed && !ct_parse_rule(value, trophy.rule))
 			{
+				CT_PROBLEM("'%s' has a rule that cannot be understood, so it cannot be earned yet", trophy.name);
 				// Keep the trophy, it just cannot be earned until the rule is fixed
 				trophy.rule = {};
 			}
@@ -1692,13 +1712,35 @@ static u32 ct_merge_custom(ct_rules_set& set, const std::string& trp_name)
 
 	if (count + set.custom.size() > 128)
 	{
-		sceNpTrophy.error("Custom trophy rules: too many custom trophies (a set can hold 128 in total)");
+		CT_PROBLEM("too many custom trophies (a set can hold 128 in total)");
 		return count;
 	}
 
 	if (set.original_count < 0)
 	{
 		set.original_count = static_cast<s32>(count);
+	}
+
+	// A set can only have one platinum
+	const bool has_platinum = conf.find("ttype=\"P\"") != umax;
+	bool custom_platinum = false;
+
+	for (ct_custom_trophy& trophy : set.custom)
+	{
+		if (trophy.grade != 'P' || trophy.deleted)
+		{
+			continue;
+		}
+
+		if (has_platinum || custom_platinum)
+		{
+			CT_PROBLEM("'%s' cannot be a platinum: this trophy set already has one. It is hidden.", trophy.name);
+			trophy.deleted = true;
+			trophy.grade = 'G';
+			continue;
+		}
+
+		custom_platinum = true;
 	}
 
 	std::string blocks{s_marker};
@@ -1727,6 +1769,15 @@ static u32 ct_merge_custom(ct_rules_set& set, const std::string& trp_name)
 		if (trophy.deleted)
 		{
 			set.removed.insert(id);
+		}
+		else if (trophy.grade == 'P')
+		{
+			ct_rule rule{};
+			rule.id = static_cast<s32>(id);
+			rule.all_others = true;
+			rule.text = "every other trophy is unlocked";
+			sceNpTrophy.notice("Custom trophy rules: custom platinum %d '%s'", id, trophy.name);
+			set.rules.emplace_back(std::move(rule));
 		}
 		else if (!trophy.rule.steps.empty())
 		{
@@ -1775,7 +1826,7 @@ static u32 ct_merge_custom(ct_rules_set& set, const std::string& trp_name)
 		}
 		else
 		{
-			sceNpTrophy.error("Custom trophy rules: failed to update %s", name);
+			CT_PROBLEM("failed to update %s", name);
 		}
 	}
 
@@ -1987,12 +2038,37 @@ static ct_rules_set& ct_get_rules(const std::string& trp_name, bool reload = fal
 
 	if (reload || !set.loaded)
 	{
+		std::vector<std::string> problems;
+		s_ct_problems = &problems;
+
 		ct_load(set, trp_name);
 
 		// Also done when a savestate skipped sceNpTrophyRegisterContext; merging twice is harmless
 		set.defined_trophies = ct_merge_custom(set, trp_name);
 		ct_write_hidden(set, trp_name);
 		ct_load_counts(set, trp_name);
+
+		s_ct_problems = nullptr;
+
+		// Tell the app what went wrong (or that nothing did)
+		const std::string problems_path = vfs::get("/dev_hdd0/home/" + Emu.GetUsr() + "/trophy_rules/" + trp_name + "_problems.txt");
+
+		if (problems.empty())
+		{
+			fs::remove_file(problems_path);
+		}
+		else if (fs::file out{problems_path, fs::rewrite})
+		{
+			std::string text;
+
+			for (const std::string& problem : problems)
+			{
+				text += problem;
+				text += '\n';
+			}
+
+			out.write(text.data(), text.size());
+		}
 	}
 
 	return set;
@@ -2148,6 +2224,82 @@ static u32 np_trophy_unlock_impl(ppu_thread& ppu, trophy_context_t* ctxt, const 
 	return unlocked_platinum_id;
 }
 
+// Locks a custom trophy again and forgets its rule's progress (sequence step, counts), so that
+// a rule can be tested repeatedly. index is the trophy's position in the rules file's custom
+// list. For trophy authors; called from the app, not from the game.
+bool sceNpTrophy_reset_custom(u32 index)
+{
+	auto& trophy_manager = g_fxo->get<sce_np_trophy_manager>();
+
+	std::scoped_lock lock(trophy_manager.mtx);
+
+	if (!trophy_manager.is_initialized)
+	{
+		return false;
+	}
+
+	bool done = false;
+
+	for (u32 context = trophy_context_t::id_base; context < trophy_context_t::id_base + trophy_context_t::id_count; context++)
+	{
+		const auto ctxt = idm::check_unlocked<trophy_context_t>(context);
+
+		if (!ctxt || ctxt->read_only || !ctxt->tropusr)
+		{
+			continue;
+		}
+
+		ct_rules_set& rules = ct_get_rules(ctxt->trp_name);
+
+		if (index >= rules.custom.size() || rules.defined_trophies < rules.custom.size())
+		{
+			continue;
+		}
+
+		const u32 id = rules.defined_trophies - static_cast<u32>(rules.custom.size()) + index;
+
+		if (!ctxt->tropusr->LockTrophy(id))
+		{
+			continue;
+		}
+
+		const std::string path = "/dev_hdd0/home/" + Emu.GetUsr() + "/trophy/" + ctxt->trp_name + "/TROPUSR.DAT";
+
+		if (!ctxt->tropusr->Save(path))
+		{
+			sceNpTrophy.error("Custom trophy rules: failed to save '%s'", path);
+		}
+
+		for (ct_rule& rule : rules.rules)
+		{
+			if (rule.id == static_cast<s32>(id))
+			{
+				rule.current = 0;
+				rule.progress_shown = -1;
+			}
+		}
+
+		ct_for_each_op(rules, [&](s32 rule_id, ct_op& op)
+		{
+			if (rule_id == static_cast<s32>(id))
+			{
+				op.state = 0;
+				op.has_state = false;
+				op.flag = false;
+			}
+		});
+
+		rules.progress_dirty = true;
+		rules.next_progress_write = 0;
+		ct_save_counts(rules, ctxt->trp_name);
+
+		sceNpTrophy.success("Custom trophy rules: trophy %d was reset", id);
+		done = true;
+	}
+
+	return done;
+}
+
 // Called regularly from cellSysutilCheckCallback (which games call about once per frame)
 void sceNpTrophy_check_custom_rules(ppu_thread& ppu)
 {
@@ -2186,6 +2338,20 @@ void sceNpTrophy_check_custom_rules(ppu_thread& ppu)
 
 		ct_rules_set& rules = ct_get_rules(ctxt->trp_name);
 
+		if (!rules.resize_tried && rules.defined_trophies != 0 && ctxt->tropusr->GetTrophiesCount() != rules.defined_trophies)
+		{
+			// A savestate was loaded after custom trophies were added or removed: the progress
+			// data still has the old size. Same fix as in sceNpTrophyRegisterContext.
+			rules.resize_tried = true;
+
+			const std::string dir = "/dev_hdd0/home/" + Emu.GetUsr() + "/trophy/" + ctxt->trp_name;
+
+			if (!ctxt->tropusr->SyncWithConfig(dir + "/TROPUSR.DAT", dir + "/TROPCONF.SFM"))
+			{
+				sceNpTrophy.error("Custom trophy rules: failed to resize TROPUSR.DAT after loading a savestate");
+			}
+		}
+
 		if (!rules.active())
 		{
 			continue;
@@ -2205,7 +2371,7 @@ void sceNpTrophy_check_custom_rules(ppu_thread& ppu)
 			{
 				if (rule.id >= count)
 				{
-					sceNpTrophy.error("Custom trophy rules: trophy %d has a rule but the trophy data only has %d trophies. TROPHY.TRP and TROPUSR.DAT must both include it.", rule.id, count);
+					CT_PROBLEM("trophy %d has a rule but the trophy data only has %d trophies. TROPHY.TRP and TROPUSR.DAT must both include it.", rule.id, count);
 				}
 				else if (ctxt->tropusr->GetTrophyUnlockState(rule.id))
 				{
@@ -2239,7 +2405,36 @@ void sceNpTrophy_check_custom_rules(ppu_thread& ppu)
 				continue;
 			}
 
-			if (ctxt->tropusr->GetTrophyUnlockState(rule.id) || ctxt->tropusr->GetTrophyGrade(rule.id) == SCE_NP_TROPHY_GRADE_PLATINUM)
+			if (ctxt->tropusr->GetTrophyUnlockState(rule.id))
+			{
+				continue;
+			}
+
+			if (rule.all_others)
+			{
+				// Custom platinum: everything else that still exists has to be unlocked
+				bool all = true;
+
+				for (s32 other = 0; other < count && all; other++)
+				{
+					if (other == rule.id || rules.is_removed(other) || ctxt->tropusr->GetTrophyGrade(other) == SCE_NP_TROPHY_GRADE_PLATINUM)
+					{
+						continue;
+					}
+
+					all = !!ctxt->tropusr->GetTrophyUnlockState(other);
+				}
+
+				if (all)
+				{
+					sceNpTrophy.success("Custom trophy rules: custom platinum %d earned", rule.id);
+					np_trophy_unlock_impl(ppu, ctxt, rules, rule.id, true);
+				}
+
+				continue;
+			}
+
+			if (ctxt->tropusr->GetTrophyGrade(rule.id) == SCE_NP_TROPHY_GRADE_PLATINUM)
 			{
 				continue;
 			}

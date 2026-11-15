@@ -182,3 +182,7 @@ void sceNpTrophy_check_custom_rules(ppu_thread& ppu);
 
 // Current value of a rule expression (memory search watch list). False if unreadable.
 bool sceNpTrophy_eval_expression(std::string_view text, f64& result);
+
+// Lock a custom trophy again and clear its rule's progress (for testing rules). index is its
+// position in the rules file's custom list.
+bool sceNpTrophy_reset_custom(u32 index);
