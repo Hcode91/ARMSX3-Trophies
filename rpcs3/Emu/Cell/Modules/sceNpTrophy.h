@@ -186,3 +186,6 @@ bool sceNpTrophy_eval_expression(std::string_view text, f64& result);
 // Lock a custom trophy again and clear its rule's progress (for testing rules). index is its
 // position in the rules file's custom list.
 bool sceNpTrophy_reset_custom(u32 index);
+
+// True once the running game has initialised the trophy system itself (sceNpTrophyInit)
+bool sceNpTrophy_game_uses_trophies();

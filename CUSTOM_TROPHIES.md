@@ -75,6 +75,37 @@ The memory search screen does all of this for you: **Create trophy** (tap a resu
 the game's custom trophies with **Edit** and **Delete**, and **Export pack** / **Import pack**,
 which save or install the rules file together with its icons as one zip.
 
+## Games without trophies
+
+A game that never had trophy support (or a version without them, such as some original disc
+releases) can still get a trophy set. Name the rules file after the game's serial instead of
+a trophy ID:
+
+```yaml
+# dev_hdd0/home/<user>/trophy_rules/BLUS30256.yml
+title: "50 Cent: Blood on the Sand"    # optional, the game's own title otherwise
+game: PPU-...                          # optional, as for any rules file
+custom:
+  - name: "First blood"
+    detail: "Kill an enemy"
+    grade: B
+    when: "[[0x123456]+0x10] >= 1"
+  - name: "Completionist"
+    grade: P                           # optional platinum, earned by unlocking the rest
+```
+
+When the game starts, the emulator builds the whole set from that file: a trophy folder named
+after the serial, the game's own icon, and a progress file. Every trophy in it is custom, so
+nothing is ever sent online. Rules, pop-ups, the trophy list, savestates, Reset, and pack
+import/export all work as for any other set.
+
+The memory search's **Create trophy** form does this for you: in a game without trophies it
+writes the serial-named file, so after the first trophy is created and the game restarted,
+the set exists.
+
+If the game does register a trophy set of its own, that set is used instead and a
+serial-named file is ignored.
+
 ## Conditions
 
 `<value> <compare> <value>`, compare being `==  !=  >=  <=  >  <`. Several conditions can be

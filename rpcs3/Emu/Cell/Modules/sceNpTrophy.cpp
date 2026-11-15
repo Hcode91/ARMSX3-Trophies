@@ -484,6 +484,11 @@ struct ct_rules_set
 struct custom_trophy_state
 {
 	std::map<std::string, ct_rules_set> sets;
+
+	// The trophy set made for a game without trophies (ct_get_synthetic). Not registered with
+	// idm: the game knows nothing about it, only the rules use it.
+	std::unique_ptr<trophy_context_t> synthetic;
+	bool synthetic_tried = false;
 	std::map<std::string, std::set<s32>> traced; // Trophy ids already written to the trace this session
 
 	custom_trophy_state() = default;
@@ -1705,7 +1710,8 @@ static u32 ct_merge_custom(ct_rules_set& set, const std::string& trp_name)
 		}
 	}
 
-	if (count == 0 || set.custom.empty())
+	// A set the emulator made for a game without trophies (ct_get_synthetic) starts with none
+	if (set.custom.empty())
 	{
 		return count;
 	}
@@ -2224,6 +2230,185 @@ static u32 np_trophy_unlock_impl(ppu_thread& ppu, trophy_context_t* ctxt, const 
 	return unlocked_platinum_id;
 }
 
+// Trophy sets for games WITHOUT trophy support.
+//
+// Such a game never calls sceNpTrophyRegisterContext, so there is no set to add custom trophies
+// to. If a rules file named after the game's serial exists
+// (/dev_hdd0/home/<user>/trophy_rules/BLUS30256.yml), the emulator makes the set itself: a
+// trophy folder named after the serial with definitions built from the file's `custom:` list,
+// the game's own ICON0.PNG, and a progress file. Nothing about it is ever sent online.
+//
+//   title: "50 Cent: Blood on the Sand"   # optional, the game's own title otherwise
+//   game: PPU-...                         # optional, as for any rules file
+//   custom:
+//     - name: "First blood"
+//       ...
+//
+// Tried once per boot, on the first rules check. Must be called with
+// sce_np_trophy_manager::mtx held.
+static trophy_context_t* ct_get_synthetic()
+{
+	auto& state = g_fxo->get<custom_trophy_state>();
+
+	if (state.synthetic_tried)
+	{
+		return state.synthetic.get();
+	}
+
+	state.synthetic_tried = true;
+
+	const std::string title_id = Emu.GetTitleID();
+
+	if (title_id.size() < 4 || title_id.size() > 16 || !std::all_of(title_id.begin(), title_id.end(), [](char c) { return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); }))
+	{
+		return nullptr;
+	}
+
+	const std::string home = "/dev_hdd0/home/" + Emu.GetUsr();
+	const std::string rules_path = vfs::get(home + "/trophy_rules/" + title_id + ".yml");
+
+	if (rules_path.empty() || !fs::is_file(rules_path))
+	{
+		return nullptr;
+	}
+
+	// The set's title: the file's, or the game's own
+	std::string title = Emu.GetTitle();
+
+	if (fs::file file{rules_path})
+	{
+		const auto loaded = yaml_load(file.to_string());
+
+		if (loaded.second.empty() && loaded.first.IsMap())
+		{
+			if (const YAML::Node node = loaded.first["title"]; node && node.IsScalar() && !node.Scalar().empty())
+			{
+				title = node.Scalar();
+			}
+		}
+	}
+
+	const std::string set_path = home + "/trophy/" + title_id;
+	const std::string dir = vfs::get(set_path + "/");
+
+	if (dir.empty() || !fs::create_path(dir))
+	{
+		sceNpTrophy.error("Custom trophy rules: cannot create the trophy folder for %s", title_id);
+		return nullptr;
+	}
+
+	// Base definitions with no trophies of their own, rebuilt on every boot; ct_merge_custom
+	// adds the pack's trophies to them
+	const std::string conf = fmt::format(
+		"<trophyconf version=\"1.1\">\n"
+		" <npcommid>%s</npcommid>\n"
+		" <trophyset-version>01.00</trophyset-version>\n"
+		" <parental-level license-area=\"default\">0</parental-level>\n"
+		" <title-name>%s</title-name>\n"
+		" <title-detail>Custom trophies</title-detail>\n"
+		"</trophyconf>\n",
+		title_id, ct_xml_escape(title.empty() ? title_id : title));
+
+	for (const char* name : {"TROPCONF.SFM", "TROP.SFM"})
+	{
+		fs::file out{dir + name, fs::rewrite};
+
+		if (!out || out.write(conf.data(), conf.size()) != conf.size())
+		{
+			sceNpTrophy.error("Custom trophy rules: cannot write %s for %s", name, title_id);
+			return nullptr;
+		}
+	}
+
+	// The game's icon, for the set and for custom trophies without one of their own
+	for (const bool disc : {true, false})
+	{
+		const std::string sfo_dir = Emu.GetSfoDir(disc);
+
+		if (!sfo_dir.empty() && fs::copy_file(sfo_dir + "/ICON0.PNG", dir + "ICON0.PNG", true))
+		{
+			break;
+		}
+	}
+
+	// Load the rules and merge the custom trophies into the definitions written above
+	ct_rules_set& rules = ct_get_rules(title_id, true);
+	rules.original_count = 0; // every trophy in this set is custom
+
+	if (rules.defined_trophies == 0)
+	{
+		sceNpTrophy.error("Custom trophy rules: %s has no usable custom trophies, so no trophy set was made", title_id);
+		return nullptr;
+	}
+
+	auto ctxt = std::make_unique<trophy_context_t>();
+	ctxt->trp_name = title_id;
+	ctxt->tropusr = std::make_unique<TROPUSRLoader>();
+
+	const std::string usr_path = set_path + "/TROPUSR.DAT";
+	const std::string conf_path = set_path + "/TROPCONF.SFM";
+
+	if (!ctxt->tropusr->Load(usr_path, conf_path).success)
+	{
+		sceNpTrophy.error("Custom trophy rules: cannot create TROPUSR.DAT for %s", title_id);
+		return nullptr;
+	}
+
+	if (ctxt->tropusr->GetTrophiesCount() != rules.defined_trophies && !ctxt->tropusr->SyncWithConfig(usr_path, conf_path))
+	{
+		sceNpTrophy.error("Custom trophy rules: cannot resize TROPUSR.DAT for %s", title_id);
+	}
+
+	// So that the trophy list (home menu, app) shows this set as the running game's
+	{
+		current_trophy_name& current_id = g_fxo->get<current_trophy_name>();
+		std::lock_guard lock(current_id.mtx);
+
+		if (current_id.name.empty())
+		{
+			current_id.name = title_id;
+		}
+	}
+
+	sceNpTrophy.success("Custom trophy rules: made a trophy set for %s (%s) with %d trophies", title_id, title, rules.defined_trophies);
+
+	state.synthetic = std::move(ctxt);
+	return state.synthetic.get();
+}
+
+// The trophy sets the rules run on: the ones the game registered, or the one made for it.
+// Must be called with sce_np_trophy_manager::mtx held.
+static std::vector<trophy_context_t*> ct_contexts(bool game_has_trophies)
+{
+	std::vector<trophy_context_t*> contexts;
+
+	if (game_has_trophies)
+	{
+		for (u32 context = trophy_context_t::id_base; context < trophy_context_t::id_base + trophy_context_t::id_count; context++)
+		{
+			if (const auto ctxt = idm::check_unlocked<trophy_context_t>(context); ctxt && !ctxt->read_only && ctxt->tropusr)
+			{
+				contexts.push_back(ctxt);
+			}
+		}
+	}
+
+	if (contexts.empty())
+	{
+		if (trophy_context_t* synthetic = ct_get_synthetic())
+		{
+			contexts.push_back(synthetic);
+		}
+	}
+
+	return contexts;
+}
+
+bool sceNpTrophy_game_uses_trophies()
+{
+	return g_fxo->get<sce_np_trophy_manager>().is_initialized;
+}
+
 // Locks a custom trophy again and forgets its rule's progress (sequence step, counts), so that
 // a rule can be tested repeatedly. index is the trophy's position in the rules file's custom
 // list. For trophy authors; called from the app, not from the game.
@@ -2233,22 +2418,10 @@ bool sceNpTrophy_reset_custom(u32 index)
 
 	std::scoped_lock lock(trophy_manager.mtx);
 
-	if (!trophy_manager.is_initialized)
-	{
-		return false;
-	}
-
 	bool done = false;
 
-	for (u32 context = trophy_context_t::id_base; context < trophy_context_t::id_base + trophy_context_t::id_count; context++)
+	for (trophy_context_t* ctxt : ct_contexts(trophy_manager.is_initialized))
 	{
-		const auto ctxt = idm::check_unlocked<trophy_context_t>(context);
-
-		if (!ctxt || ctxt->read_only || !ctxt->tropusr)
-		{
-			continue;
-		}
-
 		ct_rules_set& rules = ct_get_rules(ctxt->trp_name);
 
 		if (index >= rules.custom.size() || rules.defined_trophies < rules.custom.size())
@@ -2322,20 +2495,15 @@ void sceNpTrophy_check_custom_rules(ppu_thread& ppu)
 
 	std::unique_lock lock(trophy_manager.mtx, std::try_to_lock);
 
-	if (!lock || !trophy_manager.is_initialized)
+	if (!lock)
 	{
 		return;
 	}
 
-	for (u32 context = trophy_context_t::id_base; context < trophy_context_t::id_base + trophy_context_t::id_count; context++)
+	// A game without trophy support never initialises the trophy manager; its set (if a rules
+	// file asks for one) is made by ct_get_synthetic
+	for (trophy_context_t* ctxt : ct_contexts(trophy_manager.is_initialized))
 	{
-		const auto ctxt = idm::check_unlocked<trophy_context_t>(context);
-
-		if (!ctxt || ctxt->read_only || !ctxt->tropusr)
-		{
-			continue;
-		}
-
 		ct_rules_set& rules = ct_get_rules(ctxt->trp_name);
 
 		if (!rules.resize_tried && rules.defined_trophies != 0 && ctxt->tropusr->GetTrophiesCount() != rules.defined_trophies)

@@ -163,7 +163,7 @@ object MemorySearch {
     private var watchSet = ""
 
     private fun watchFile(): File? {
-        val set = runCatching { ARMSX3.instance.getCurrentTrophyName() }.getOrNull()?.trim().orEmpty()
+        val set = currentSet()
         if (set.isEmpty()) return null
         val user = runCatching { ARMSX3.instance.getUser() }.getOrNull()?.takeIf { it.isNotBlank() } ?: "00000001"
         return File(File(ARMSX3.getHdd0Dir(), "home/$user/trophy_rules"), "${set}_watch.txt")
@@ -294,8 +294,32 @@ object MemorySearch {
         return File(ARMSX3.getHdd0Dir(), "home/$user/trophy_rules")
     }
 
-    private fun currentSet(): String =
-        runCatching { ARMSX3.instance.getCurrentTrophyName() }.getOrNull()?.trim().orEmpty()
+    /** The core's `info` reply: PPU hash, serial, whether the game uses trophies, title. */
+    private data class GameInfo(val hash: String?, val serial: String?, val usesTrophies: Boolean, val title: String)
+
+    private fun gameInfo(): GameInfo? {
+        val reply = call("info")
+        if (!reply.startsWith("ok")) return null
+        val parts = reply.removePrefix("ok").trim().split(' ', limit = 4)
+        return GameInfo(
+            hash = parts.getOrNull(0)?.takeIf { it.startsWith("PPU-") },
+            serial = parts.getOrNull(1)?.takeIf { it.matches(Regex("^[A-Z]{4}\\d{5}$")) },
+            usesTrophies = parts.getOrNull(2) == "1",
+            title = parts.getOrNull(3).orEmpty().trim(),
+        )
+    }
+
+    /**
+     * The running game's trophy set: the one the game registered, or, for a game without
+     * trophy support, its serial (e.g. BLUS30256). A rules file named after the serial makes
+     * the core build a trophy set for such a game (see ct_get_synthetic in sceNpTrophy.cpp).
+     */
+    private fun currentSet(): String {
+        val registered = runCatching { ARMSX3.instance.getCurrentTrophyName() }.getOrNull()?.trim().orEmpty()
+        if (registered.isNotEmpty()) return registered
+        val info = gameInfo() ?: return ""
+        return if (!info.usesTrophies) info.serial.orEmpty() else ""
+    }
 
     /** Reads the running game's pack. Throws with a readable message if the file has a shape
      *  this screen cannot edit safely. */
@@ -305,10 +329,11 @@ object MemorySearch {
         val file = File(rulesDir(), "$set.yml")
 
         if (!file.isFile) {
-            val info = call("info")
-            val hash = info.removePrefix("ok").trim().takeIf { info.startsWith("ok") && it.startsWith("PPU-") }
+            val info = gameInfo()
             val header = mutableListOf("# Custom trophies for $set")
-            if (hash != null) header += "game: $hash"
+            // A game without trophies gets a whole set made from this file; give it a title
+            if (!set.startsWith("NPWR")) header += "title: ${quote(info?.title?.ifEmpty { set } ?: set)}"
+            info?.hash?.let { header += "game: $it" }
             header += "custom:"
             return Pack(file, header, mutableListOf())
         }
@@ -467,7 +492,7 @@ object MemorySearch {
 
     /** Writes the running game's pack (rules file + icons) as a zip to [target]. Blocking. */
     fun exportPack(context: Context, target: Uri, everyGame: Boolean = false): String = runCatching {
-        val setName = Regex("^NPWR\\d{5}_\\d{2}$")
+        val setName = Regex("^(?:NPWR\\d{5}_\\d{2}|[A-Z]{4}\\d{5})$")
         val sets = if (everyGame) {
             rulesDir().listFiles().orEmpty()
                 .filter { it.isFile && it.name.endsWith(".yml") && setName.matches(it.name.removeSuffix(".yml")) }
@@ -497,13 +522,14 @@ object MemorySearch {
     }.getOrElse { "Could not export the pack: ${it.message}" }
 
     /**
-     * Installs a pack zip made by [exportPack]. Only a `<NPWRxxxxx_00>.yml` and PNGs in the
+     * Installs a pack zip made by [exportPack]. Only a `<NPWRxxxxx_00>.yml` (or `<serial>.yml`) and PNGs in the
      * matching folder are taken, so a zip cannot write anywhere else. An existing rules file
      * for that game is kept as `.bak`. Blocking.
      */
     fun importPack(context: Context, source: Uri): String = runCatching {
-        val ymlName = Regex("^(NPWR\\d{5}_\\d{2})\\.yml$")
-        val iconName = Regex("^(NPWR\\d{5}_\\d{2})/([A-Za-z0-9_.-]+\\.(?:png|PNG))$")
+        // NPWRxxxxx_00 for a game's own trophy set, a serial (BLUS30256) for a game without one
+        val ymlName = Regex("^(NPWR\\d{5}_\\d{2}|[A-Z]{4}\\d{5})\\.yml$")
+        val iconName = Regex("^(NPWR\\d{5}_\\d{2}|[A-Z]{4}\\d{5})/([A-Za-z0-9_.-]+\\.(?:png|PNG))$")
         val limit = 5 * 1024 * 1024
         val dir = rulesDir()
         var installed: String? = null

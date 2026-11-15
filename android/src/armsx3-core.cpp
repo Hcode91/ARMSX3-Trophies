@@ -8806,7 +8806,7 @@ extern "C" void *_armsx3_setCustomDriver(void *driverHandle) {
 //                                    went down / stayed the same since last time
 //   list <max>                       current candidates with their live values
 //   reset                            drop the search
-//   info                             "ok <PPU hash of the running game>"
+//   info                             "ok <PPU hash> <serial> <uses trophies 1|0> <title>"
 //   eval <expression>                current value of a rule expression, "ok <value>"
 //   resetcustom <index>              lock a custom trophy again and clear its rule progress
 //   filter <inc|dec> <n>             keep candidates that went up / down by exactly n
@@ -8973,8 +8973,20 @@ extern "C" std::string _armsx3_memSearch(std::string_view command) {
   }
 
   if (args[0] == "info") {
-    // The executable's hash, which a rules file names so it only runs on this game version
-    return "ok " + Emu.GetExecutableHash();
+    // "ok <PPU hash> <serial> <1 if the game uses trophies itself, else 0> <title...>".
+    // The hash is what a rules file names so it only runs on this game version; the rest
+    // lets the app make a rules file for a game without trophies (named after the serial).
+    std::string title = Emu.GetTitle();
+
+    for (char &c : title) {
+      if (c == '\n' || c == '\r') {
+        c = ' ';
+      }
+    }
+
+    const std::string &serial = Emu.GetTitleID();
+    return "ok " + Emu.GetExecutableHash() + " " + (serial.empty() ? std::string("-") : serial) + " " +
+           (sceNpTrophy_game_uses_trophies() ? "1" : "0") + " " + title;
   }
 
   if (args[0] == "resetcustom") {
