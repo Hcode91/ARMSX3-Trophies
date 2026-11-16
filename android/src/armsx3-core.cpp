@@ -8792,7 +8792,7 @@ extern "C" void *_armsx3_setCustomDriver(void *driverHandle) {
 #pragma GCC diagnostic pop
 
 // ---------------------------------------------------------------------------
-// Memory search (ARMSX3-Trophies)
+// Memory search (PocketTrophy)
 //
 // A small "cheat search" over guest memory, for finding the values that custom
 // trophy rules watch (see CUSTOM_TROPHIES.md). One text command in, text out, so

@@ -1,4 +1,4 @@
-# Custom trophy rules (ARMSX3-Trophies)
+# Custom trophy rules (PocketTrophy)
 
 A trophy set can carry an optional rules file. With it the emulator can
 

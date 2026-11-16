@@ -145,13 +145,13 @@ jobs:
       - name: Upload the APK
         uses: actions/upload-artifact@v4
         with:
-          name: armsx3-android-arm64
+          name: pockettrophy-android-arm64
           path: android/armsx3-ui/app/build/outputs/apk/github/release/*.apk
           if-no-files-found: error
 
   ios-deps:
     name: iOS dependencies
-    # ARMSX3-Trophies: this fork only ships Android. Run by hand from the Actions tab if wanted.
+    # PocketTrophy: this fork only ships Android. Run by hand from the Actions tab if wanted.
     if: github.event_name == 'workflow_dispatch'
     runs-on: xcode-27
     timeout-minutes: 360
@@ -174,7 +174,7 @@ jobs:
 
   ios:
     name: iOS
-    # ARMSX3-Trophies: this fork only ships Android. Run by hand from the Actions tab if wanted.
+    # PocketTrophy: this fork only ships Android. Run by hand from the Actions tab if wanted.
     if: github.event_name == 'workflow_dispatch'
     needs: ios-deps
     runs-on: xcode-27

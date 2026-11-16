@@ -123,17 +123,17 @@ fun ArmsBackdrop(
 @Composable
 fun ArmsLogo(modifier: Modifier = Modifier, showWordmark: Boolean = true, iconSize: Dp = 42.dp) {
     Row(modifier = modifier, verticalAlignment = Alignment.CenterVertically) {
-        // The ARMSX3 mark, circle-cropped so its dark square corners don't show —
+        // The app mark, circle-cropped so its dark square corners don't show —
         // matches the round hero render.
         Image(
             painter = painterResource(id = R.drawable.ic_armsx3_mark),
-            contentDescription = "ARMSX3",
+            contentDescription = "PocketTrophy",
             modifier = Modifier.size(iconSize).clip(CircleShape),
         )
         if (showWordmark) {
             Spacer(Modifier.width(12.dp))
             Text(
-                text = "ARMSX3",
+                text = "PocketTrophy",
                 color = MaterialTheme.colorScheme.onSurface,
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Black,

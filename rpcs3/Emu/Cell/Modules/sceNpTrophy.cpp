@@ -295,7 +295,7 @@ static void show_trophy_notification(const trophy_context_t* ctxt, s32 trophyId)
 }
 
 // ---------------------------------------------------------------------------------------
-// Custom trophy rules (ARMSX3-Trophies)
+// Custom trophy rules (PocketTrophy)
 //
 // An optional rules file lets a trophy pack award trophies from the emulator side, by
 // watching guest memory, instead of patching game code. It can also "remove" trophies

@@ -694,7 +694,7 @@ error_code cellSysutilCheckCallback(ppu_thread& ppu)
 {
 	cellSysutil.trace("cellSysutilCheckCallback()");
 
-	// Custom trophy rules (ARMSX3-Trophies): cheap unless a rules file is present
+	// Custom trophy rules (PocketTrophy): cheap unless a rules file is present
 	sceNpTrophy_check_custom_rules(ppu);
 
 	auto& cbm = g_fxo->get<sysutil_cb_manager>();

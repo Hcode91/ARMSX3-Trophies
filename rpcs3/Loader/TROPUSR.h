@@ -100,7 +100,7 @@ public:
 	[[nodiscard]] bool Save(std::string_view filepath);
 
 	// Rebuild the tables for the trophies in configpath, keeping the state of every trophy
-	// that exists in both (ARMSX3-Trophies: custom trophies change the size of a set)
+	// that exists in both (PocketTrophy: custom trophies change the size of a set)
 	[[nodiscard]] bool SyncWithConfig(std::string_view filepath, std::string_view configpath);
 
 	[[nodiscard]] u32 GetTrophiesCount() const;

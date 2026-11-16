@@ -1,6 +1,6 @@
 # Custom trophy packs
 
-Packs made with ARMSX3-Trophies. Install one from the app: Trophies > Import custom trophy pack.
+Packs made with PocketTrophy. Install one from the app: Trophies > Import custom trophy pack.
 
 | Pack | Game | Notes |
 | --- | --- | --- |

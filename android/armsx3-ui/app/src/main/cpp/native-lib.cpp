@@ -1845,7 +1845,7 @@ Java_com_armsx3_core_ARMSX3_patchesList(JNIEnv *env, jobject, jstring jserial) {
   return wrap(env, coreLib.patchesList(unwrap(env, jserial)));
 }
 
-// Memory search for custom trophy rules (ARMSX3-Trophies). One text command in, text out;
+// Memory search for custom trophy rules (PocketTrophy). One text command in, text out;
 // see _armsx3_memSearch in armsx3-core.cpp for the commands.
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_armsx3_core_ARMSX3_memSearch(JNIEnv *env, jobject, jstring jcommand) {

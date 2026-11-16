@@ -50,7 +50,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
- * Memory search for custom trophy rules (ARMSX3-Trophies).
+ * Memory search for custom trophy rules (PocketTrophy).
  *
  * The classic "cheat search": look for a number you can see in the game, go back and change
  * it, then narrow the candidates down until only the address that really holds it is left.

@@ -113,7 +113,7 @@ fun TrophiesScreen(
                 Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                // Custom trophy packs (ARMSX3-Trophies): install or back up packs without having to
+                // Custom trophy packs (PocketTrophy): install or back up packs without having to
                 // start a game. A pack is a zip of rules files and icons, see CUSTOM_TROPHIES.md.
                 if (!currentGameOnly) {
                     val packContext = androidx.compose.ui.platform.LocalContext.current

@@ -376,7 +376,7 @@ class EmulationMenuViewModel(application: Application) : AndroidViewModel(applic
 
     /** Open the full trophy list over the paused game, scoped to the running title. */
     fun openTrophies() = com.armsx2.ui.WindowImpl.openInGameScreen(com.armsx2.ui.InGameScreen.Trophies)
-    /** Memory search for custom trophy rules (ARMSX3-Trophies). */
+    /** Memory search for custom trophy rules (PocketTrophy). */
     fun openMemorySearch() = com.armsx2.ui.WindowImpl.openInGameScreen(com.armsx2.ui.InGameScreen.MemorySearch)
 
     fun updateSettings(transform: (Settings) -> Settings) {

@@ -160,7 +160,7 @@ object TrophyRepository {
             .getOrNull()?.trim()?.takeIf { it.isNotEmpty() } ?: return emptyList()
         // TROPDIR/<NPWRxxxxx_00>/TROPHY.TRP — the folder names are the comm ids.
         // Last resort: a set the core made for a game without trophies is named after the
-        // serial itself (ARMSX3-Trophies, see ct_get_synthetic in sceNpTrophy.cpp).
+        // serial itself (PocketTrophy, see ct_get_synthetic in sceNpTrophy.cpp).
         return File(hdd0(), "game/$titleId/TROPDIR").listFiles().orEmpty()
             .filter { it.isDirectory }
             .map { it.name } + titleId
