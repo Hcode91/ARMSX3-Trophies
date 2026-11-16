@@ -108,6 +108,7 @@
 #include <functional>
 #include <iterator>
 #include <jni.h>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -8789,3 +8790,691 @@ extern "C" void *_armsx3_setCustomDriver(void *driverHandle) {
 }
 
 #pragma GCC diagnostic pop
+
+// ---------------------------------------------------------------------------
+// Memory search (PocketTrophy)
+//
+// A small "cheat search" over guest memory, for finding the values that custom
+// trophy rules watch (see CUSTOM_TROPHIES.md). One text command in, text out, so
+// the JNI bridge stays a single function:
+//
+//   new <u8|u16|u32|f32> <value>     start a search for an exact value
+//   new <u8|u16|u32|f32> ?           start a search for an unknown value: remembers
+//                                    all writable memory, to be narrowed by filters
+//   filter eq <value>                keep candidates that now equal <value>
+//   filter <ne|gt|lt|same> [-]       keep candidates that changed / went up /
+//                                    went down / stayed the same since last time
+//   list <max>                       current candidates with their live values
+//   reset                            drop the search
+//   info                             "ok <PPU hash> <serial> <uses trophies 1|0> <title>"
+//   eval <expression>                current value of a rule expression, "ok <value>"
+//   resetcustom <index>              lock a custom trophy again and clear its rule progress
+//   filter <inc|dec> <n>             keep candidates that went up / down by exactly n
+//   pointer <hex addr>               find fixed places that point at (or just before)
+//                                    an address, directly or through up to two more pointers.
+//                                    Reply lines are address expressions such as
+//                                    "[0xf3f20]+0x48" or "[[0xf3c18]+0x124]+0x1c".
+//
+// Reply: "ok <count> <truncated 0|1> <type>" then, for list, "<hex addr> <value>"
+// lines; or "err <message>".
+//
+// Only aligned addresses are considered, and values are big-endian like the PS3.
+// ---------------------------------------------------------------------------
+namespace {
+struct MemSearchState {
+  std::mutex mtx;
+  std::string type;            // empty = no search
+  u32 size = 4;
+  bool is_float = false;
+  bool truncated = false;
+  std::vector<std::pair<u32, u32>> hits; // address, raw value at the last step
+
+  // Unknown-value search: a copy of every writable page plus one "still a candidate" bit
+  // per slot. Turned into `hits` (and freed) as soon as few enough candidates are left.
+  struct Page {
+    u32 addr = 0;
+    u8 data[4096]{};
+    u64 alive[64]{};
+  };
+
+  std::vector<std::unique_ptr<Page>> pages;
+  usz alive_count = 0;
+
+  usz count() const { return pages.empty() ? hits.size() : alive_count; }
+
+  void clear() {
+    hits.clear();
+    hits.shrink_to_fit();
+    pages.clear();
+    pages.shrink_to_fit();
+    alive_count = 0;
+    truncated = false;
+  }
+};
+
+MemSearchState g_mem_search;
+
+constexpr usz mem_search_max_hits = 4'000'000;
+constexpr usz mem_search_max_pages = 384u * 1024 * 1024 / 4096; // unknown-value snapshot limit
+constexpr usz mem_search_convert_at = 1'000'000;                // snapshot -> hit list below this
+
+// Main memory + user memory, then the stack area. Video memory is skipped.
+constexpr std::pair<u32, u32> mem_search_ranges[] = {
+    {0x00010000u, 0x40000000u},
+    {0xD0000000u, 0xE0000000u},
+};
+
+u32 mem_search_raw(const u8 *p, u32 size) {
+  if (size == 1) {
+    return p[0];
+  }
+
+  if (size == 2) {
+    return (u32{p[0]} << 8) | u32{p[1]};
+  }
+
+  return (u32{p[0]} << 24) | (u32{p[1]} << 16) | (u32{p[2]} << 8) | u32{p[3]};
+}
+
+double mem_search_number(u32 raw, bool is_float) {
+  if (is_float) {
+    float f = 0;
+    std::memcpy(&f, &raw, sizeof(f));
+    return f;
+  }
+
+  return raw;
+}
+
+std::string mem_search_text(u32 raw, bool is_float) {
+  if (is_float) {
+    char text[48]{};
+    std::snprintf(text, sizeof(text), "%g", mem_search_number(raw, true));
+    return text;
+  }
+
+  return fmt::format("%u", raw);
+}
+
+// What the user typed, as something a raw value can be compared with
+struct MemSearchValue {
+  bool valid = false;
+  double number = 0;
+  double tolerance = 0;
+};
+
+MemSearchValue mem_search_parse(const std::string &text, u32 size, bool is_float) {
+  MemSearchValue out;
+
+  if (text.empty()) {
+    return out;
+  }
+
+  char *end = nullptr;
+
+  if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+    out.number = static_cast<double>(std::strtoull(text.c_str() + 2, &end, 16));
+  } else {
+    out.number = std::strtod(text.c_str(), &end);
+  }
+
+  if (!end || *end != '\0') {
+    return out;
+  }
+
+  if (is_float) {
+    // "12" matches 12.0 to 12.99ish either side; "12.5" has to be close
+    out.tolerance = text.find('.') == std::string::npos ? 1.0 : 0.01;
+  } else if (out.number < 0) {
+    // Negative numbers are stored as two's complement
+    const double range = size == 1 ? 256.0 : size == 2 ? 65536.0 : 4294967296.0;
+    out.number += range;
+  }
+
+  out.valid = true;
+  return out;
+}
+
+bool mem_search_equal(u32 raw, bool is_float, const MemSearchValue &value) {
+  const double number = mem_search_number(raw, is_float);
+
+  if (is_float) {
+    return number == number && number - value.number < value.tolerance && value.number - number < value.tolerance;
+  }
+
+  return number == value.number;
+}
+
+std::string mem_search_reply(const MemSearchState &state) {
+  return fmt::format("ok %u %d %s", state.count(), state.truncated ? 1 : 0, state.type.empty() ? "-" : state.type);
+}
+} // namespace
+
+extern "C" std::string _armsx3_memSearch(std::string_view command) {
+  std::lock_guard lock(g_mem_search.mtx);
+  MemSearchState &state = g_mem_search;
+
+  const std::vector<std::string> args = fmt::split(command, {" "});
+
+  if (args.empty()) {
+    return "err empty command";
+  }
+
+  if (args[0] == "reset") {
+    state.type.clear();
+    state.clear();
+    return mem_search_reply(state);
+  }
+
+  if (Emu.IsStopped()) {
+    state.type.clear();
+    state.clear();
+    return "err no game is running";
+  }
+
+  if (args[0] == "info") {
+    // "ok <PPU hash> <serial> <1 if the game uses trophies itself, else 0> <title...>".
+    // The hash is what a rules file names so it only runs on this game version; the rest
+    // lets the app make a rules file for a game without trophies (named after the serial).
+    std::string title = Emu.GetTitle();
+
+    for (char &c : title) {
+      if (c == '\n' || c == '\r') {
+        c = ' ';
+      }
+    }
+
+    const std::string &serial = Emu.GetTitleID();
+    return "ok " + Emu.GetExecutableHash() + " " + (serial.empty() ? std::string("-") : serial) + " " +
+           (sceNpTrophy_game_uses_trophies() ? "1" : "0") + " " + title;
+  }
+
+  if (args[0] == "resetcustom") {
+    // Lock custom trophy number <index in the rules file> again, for testing its rule
+    if (args.size() < 2) {
+      return "err usage: resetcustom <index>";
+    }
+
+    const u32 index = static_cast<u32>(std::strtoul(args[1].c_str(), nullptr, 10));
+    return sceNpTrophy_reset_custom(index) ? "ok" : "err that trophy is not loaded in the running game";
+  }
+
+  if (args[0] == "eval") {
+    // Everything after "eval " is the expression (it may contain spaces)
+    const usz start = command.find("eval");
+    std::string_view expr = command.substr(start + 4);
+
+    while (!expr.empty() && expr.front() == ' ') {
+      expr.remove_prefix(1);
+    }
+
+    f64 value = 0;
+
+    if (expr.empty() || !sceNpTrophy_eval_expression(expr, value)) {
+      return "err unreadable";
+    }
+
+    char text[48]{};
+
+    if (value == static_cast<f64>(static_cast<s64>(value)) && value > -9.0e15 && value < 9.0e15) {
+      std::snprintf(text, sizeof(text), "%lld", static_cast<long long>(value));
+    } else {
+      std::snprintf(text, sizeof(text), "%g", value);
+    }
+
+    return std::string("ok ") + text;
+  }
+
+  if (args[0] == "pointer") {
+    if (args.size() < 2) {
+      return "err usage: pointer <hex address>";
+    }
+
+    char *end = nullptr;
+    const u64 target64 = std::strtoull(args[1].c_str(), &end, 16);
+
+    if (!end || *end != '\0' || target64 < 0x10000 || target64 > 0xFFFFFFFFull) {
+      return "err not an address";
+    }
+
+    const u32 target = static_cast<u32>(target64);
+
+    // A game's own data (which never moves) sits low in memory; everything it allocates
+    // while running sits higher and can move between sessions.
+    constexpr u32 static_end = 0x10000000u;
+    constexpr u32 max_offset = 0x1000u;
+    constexpr usz max_results = 25;
+    constexpr usz max_movable = 4000;
+
+    std::vector<std::pair<u32, u32>> fixed;   // location, offset
+    std::vector<std::pair<u32, u32>> movable; // location, offset
+    std::vector<u8> page(4096);
+
+    for (u32 addr = 0x00010000u; addr < 0x40000000u; addr += 4096) {
+      if (!vm::check_addr(addr, vm::page_readable, 4096) || !vm::try_access(addr, page.data(), 4096, false)) {
+        continue;
+      }
+
+      for (u32 off = 0; off < 4096; off += 4) {
+        const u32 value = mem_search_raw(page.data() + off, 4);
+
+        if (value > target || target - value >= max_offset || value < 0x10000) {
+          continue;
+        }
+
+        const u32 loc = addr + off;
+
+        if (loc == target) {
+          continue;
+        }
+
+        if (loc < static_end) {
+          fixed.emplace_back(loc, target - value);
+        } else if (movable.size() < max_movable) {
+          movable.emplace_back(loc, target - value);
+        }
+      }
+    }
+
+    // Smallest offset first: the closer a pointer lands, the more likely it is the real one
+    const auto by_offset = [](const std::pair<u32, u32> &a, const std::pair<u32, u32> &b) {
+      return a.second != b.second ? a.second < b.second : a.first < b.first;
+    };
+
+    std::sort(fixed.begin(), fixed.end(), by_offset);
+
+    std::vector<std::string> lines;
+
+    for (usz i = 0; i < fixed.size() && lines.size() < max_results; i++) {
+      lines.emplace_back(fmt::format("[0x%x]+0x%x", fixed[i].first, fixed[i].second));
+    }
+
+    // Second level: fixed places that point at one of the movable pointers found above
+    if (!movable.empty()) {
+      std::sort(movable.begin(), movable.end());
+
+      struct Chain {
+        u32 loc;
+        u32 off2;
+        u32 off1;
+      };
+
+      std::vector<Chain> chains;
+
+      for (u32 addr = 0x00010000u; addr < static_end && chains.size() < 2000; addr += 4096) {
+        if (!vm::check_addr(addr, vm::page_readable, 4096) || !vm::try_access(addr, page.data(), 4096, false)) {
+          continue;
+        }
+
+        for (u32 off = 0; off < 4096; off += 4) {
+          const u32 value = mem_search_raw(page.data() + off, 4);
+
+          if (value < static_end) {
+            continue;
+          }
+
+          auto it = std::lower_bound(movable.begin(), movable.end(), std::pair<u32, u32>{value, 0});
+
+          for (; it != movable.end() && it->first - value < max_offset; ++it) {
+            chains.push_back(Chain{addr + off, it->first - value, it->second});
+          }
+        }
+      }
+
+      std::sort(chains.begin(), chains.end(), [](const Chain &a, const Chain &b) {
+        const u32 sa = a.off1 + a.off2;
+        const u32 sb = b.off1 + b.off2;
+        return sa != sb ? sa < sb : a.loc < b.loc;
+      });
+
+      for (usz i = 0; i < chains.size() && lines.size() < max_results * 2; i++) {
+        lines.emplace_back(fmt::format("[[0x%x]+0x%x]+0x%x", chains[i].loc, chains[i].off2, chains[i].off1));
+      }
+    }
+
+    // Third level, for games that bury their data deeper: fixed -> movable -> movable -> value.
+    // Only tried when the shorter routes found little, since longer chains are more often
+    // coincidences.
+    if (!movable.empty() && lines.size() < max_results) {
+      struct Mid {
+        u32 loc;
+        u32 off2;
+        u32 off1;
+      };
+
+      std::vector<Mid> mids;
+
+      for (u32 addr = static_end; addr < 0x40000000u && mids.size() < max_movable; addr += 4096) {
+        if (!vm::check_addr(addr, vm::page_readable, 4096) || !vm::try_access(addr, page.data(), 4096, false)) {
+          continue;
+        }
+
+        for (u32 off = 0; off < 4096 && mids.size() < max_movable; off += 4) {
+          const u32 value = mem_search_raw(page.data() + off, 4);
+
+          if (value < static_end) {
+            continue;
+          }
+
+          auto it = std::lower_bound(movable.begin(), movable.end(), std::pair<u32, u32>{value, 0});
+
+          for (; it != movable.end() && it->first - value < max_offset && mids.size() < max_movable; ++it) {
+            if (it->first != addr + off) {
+              mids.push_back(Mid{addr + off, it->first - value, it->second});
+            }
+          }
+        }
+      }
+
+      std::sort(mids.begin(), mids.end(), [](const Mid &a, const Mid &b) { return a.loc < b.loc; });
+
+      struct Chain3 {
+        u32 loc;
+        u32 off3;
+        u32 off2;
+        u32 off1;
+      };
+
+      std::vector<Chain3> chains;
+
+      for (u32 addr = 0x00010000u; addr < static_end && chains.size() < 2000 && !mids.empty(); addr += 4096) {
+        if (!vm::check_addr(addr, vm::page_readable, 4096) || !vm::try_access(addr, page.data(), 4096, false)) {
+          continue;
+        }
+
+        for (u32 off = 0; off < 4096; off += 4) {
+          const u32 value = mem_search_raw(page.data() + off, 4);
+
+          if (value < static_end) {
+            continue;
+          }
+
+          auto it = std::lower_bound(mids.begin(), mids.end(), value, [](const Mid &mid, u32 v) { return mid.loc < v; });
+
+          for (; it != mids.end() && it->loc - value < max_offset; ++it) {
+            chains.push_back(Chain3{addr + off, it->loc - value, it->off2, it->off1});
+          }
+        }
+      }
+
+      std::sort(chains.begin(), chains.end(), [](const Chain3 &a, const Chain3 &b) {
+        const u32 sa = a.off1 + a.off2 + a.off3;
+        const u32 sb = b.off1 + b.off2 + b.off3;
+        return sa != sb ? sa < sb : a.loc < b.loc;
+      });
+
+      for (usz i = 0; i < chains.size() && i < 15; i++) {
+        lines.emplace_back(fmt::format("[[[0x%x]+0x%x]+0x%x]+0x%x", chains[i].loc, chains[i].off3, chains[i].off2, chains[i].off1));
+      }
+    }
+
+    std::string out = fmt::format("ok %u 0 ptr", lines.size());
+
+    for (const std::string &line : lines) {
+      out += '\n';
+      out += line;
+    }
+
+    return out;
+  }
+
+  if (args[0] == "new") {
+    if (args.size() < 3) {
+      return "err usage: new <type> <value>";
+    }
+
+    u32 size = 4;
+    bool is_float = false;
+
+    if (args[1] == "u8") {
+      size = 1;
+    } else if (args[1] == "u16") {
+      size = 2;
+    } else if (args[1] == "u32") {
+      size = 4;
+    } else if (args[1] == "f32") {
+      is_float = true;
+    } else {
+      return "err unknown type";
+    }
+
+    const bool unknown = args[2] == "?";
+    const MemSearchValue value = unknown ? MemSearchValue{} : mem_search_parse(args[2], size, is_float);
+
+    if (!unknown && !value.valid) {
+      return "err not a number";
+    }
+
+    state.type = args[1];
+    state.size = size;
+    state.is_float = is_float;
+    state.clear();
+
+    if (unknown) {
+      // Remember everything the game can write to; code and constants cannot be counters
+      const u32 slots = 4096 / size;
+
+      for (const auto &[begin, end] : mem_search_ranges) {
+        for (u32 addr = begin; addr < end; addr += 4096) {
+          if (!vm::check_addr(addr, vm::page_readable | vm::page_writable, 4096)) {
+            continue;
+          }
+
+          if (state.pages.size() >= mem_search_max_pages) {
+            state.truncated = true;
+            break;
+          }
+
+          auto page = std::make_unique<MemSearchState::Page>();
+          page->addr = addr;
+
+          if (!vm::try_access(addr, page->data, 4096, false)) {
+            continue;
+          }
+
+          for (u32 slot = 0; slot < slots; slot++) {
+            page->alive[slot / 64] |= u64{1} << (slot % 64);
+          }
+
+          state.alive_count += slots;
+          state.pages.emplace_back(std::move(page));
+        }
+      }
+
+      return mem_search_reply(state);
+    }
+
+    std::vector<u8> page(4096);
+
+    for (const auto &[begin, end] : mem_search_ranges) {
+      for (u32 addr = begin; addr < end && !state.truncated; addr += 4096) {
+        if (!vm::check_addr(addr, vm::page_readable, 4096) || !vm::try_access(addr, page.data(), 4096, false)) {
+          continue;
+        }
+
+        for (u32 off = 0; off + size <= 4096; off += size) {
+          const u32 raw = mem_search_raw(page.data() + off, size);
+
+          if (mem_search_equal(raw, is_float, value)) {
+            if (state.hits.size() >= mem_search_max_hits) {
+              state.truncated = true;
+              break;
+            }
+
+            state.hits.emplace_back(addr + off, raw);
+          }
+        }
+      }
+    }
+
+    return mem_search_reply(state);
+  }
+
+  if (state.type.empty()) {
+    return "err start a search first";
+  }
+
+  if (args[0] == "filter") {
+    if (args.size() < 2) {
+      return "err usage: filter <eq|ne|gt|lt|same> [value]";
+    }
+
+    const std::string &op = args[1];
+    MemSearchValue value;
+
+    if (op == "eq") {
+      value = mem_search_parse(args.size() > 2 ? args[2] : std::string{}, state.size, state.is_float);
+
+      if (!value.valid) {
+        return "err not a number";
+      }
+    } else if (op == "inc" || op == "dec") {
+      value = mem_search_parse(args.size() > 2 ? args[2] : std::string{}, 4, true);
+
+      if (!value.valid || value.number <= 0) {
+        return "err not a number";
+      }
+    } else if (op != "ne" && op != "gt" && op != "lt" && op != "same") {
+      return "err unknown filter";
+    }
+
+    const auto keeps = [&](u32 raw, u32 old_raw) {
+      if (op == "eq") {
+        return mem_search_equal(raw, state.is_float, value);
+      }
+
+      if (op == "ne") {
+        return raw != old_raw;
+      }
+
+      if (op == "same") {
+        return raw == old_raw;
+      }
+
+      const double now = mem_search_number(raw, state.is_float);
+      const double before = mem_search_number(old_raw, state.is_float);
+
+      if (op == "inc" || op == "dec") {
+        // Changed by exactly this much
+        const double change = op == "inc" ? now - before : before - now;
+        const double off = change - value.number;
+        return off > -0.001 && off < 0.001;
+      }
+
+      // NaN compares false both ways, so junk floats drop out
+      return op == "gt" ? now > before : now < before;
+    };
+
+    if (!state.pages.empty()) {
+      const u32 slots = 4096 / state.size;
+      std::vector<u8> fresh(4096);
+      usz alive = 0;
+
+      for (auto &page : state.pages) {
+        if (!vm::try_access(page->addr, fresh.data(), 4096, false)) {
+          std::memset(page->alive, 0, sizeof(page->alive));
+          continue;
+        }
+
+        for (u32 slot = 0; slot < slots; slot++) {
+          u64 &word = page->alive[slot / 64];
+          const u64 bit = u64{1} << (slot % 64);
+
+          if (!(word & bit)) {
+            // Skip whole empty words quickly
+            if (!word) {
+              slot |= 63;
+            }
+
+            continue;
+          }
+
+          const u32 off = slot * state.size;
+
+          if (keeps(mem_search_raw(fresh.data() + off, state.size), mem_search_raw(page->data + off, state.size))) {
+            alive++;
+          } else {
+            word &= ~bit;
+          }
+        }
+
+        std::memcpy(page->data, fresh.data(), 4096);
+      }
+
+      state.alive_count = alive;
+
+      if (alive <= mem_search_convert_at) {
+        // Few enough left: switch to the compact list and free the snapshot
+        state.hits.clear();
+        state.hits.reserve(alive);
+
+        for (const auto &page : state.pages) {
+          for (u32 slot = 0; slot < slots; slot++) {
+            if (page->alive[slot / 64] & (u64{1} << (slot % 64))) {
+              const u32 off = slot * state.size;
+              state.hits.emplace_back(page->addr + off, mem_search_raw(page->data + off, state.size));
+            }
+          }
+        }
+
+        state.pages.clear();
+        state.pages.shrink_to_fit();
+        state.alive_count = 0;
+        state.truncated = false;
+      }
+
+      return mem_search_reply(state);
+    }
+
+    std::vector<std::pair<u32, u32>> kept;
+    kept.reserve(state.hits.size() / 4);
+
+    for (const auto &[addr, old_raw] : state.hits) {
+      u8 buf[4]{};
+
+      if (!vm::try_access(addr, buf, state.size, false)) {
+        continue;
+      }
+
+      const u32 raw = mem_search_raw(buf, state.size);
+
+      if (keeps(raw, old_raw)) {
+        kept.emplace_back(addr, raw);
+      }
+    }
+
+    state.hits = std::move(kept);
+    return mem_search_reply(state);
+  }
+
+  if (args[0] == "list") {
+    usz max = 50;
+
+    if (args.size() > 1) {
+      max = static_cast<usz>(std::strtoul(args[1].c_str(), nullptr, 10));
+    }
+
+    std::string out = mem_search_reply(state);
+
+    if (!state.pages.empty()) {
+      // Still too many to be worth listing one by one
+      return out;
+    }
+
+    for (usz i = 0; i < state.hits.size() && i < max; i++) {
+      u8 buf[4]{};
+      const u32 addr = state.hits[i].first;
+
+      if (!vm::try_access(addr, buf, state.size, false)) {
+        fmt::append(out, "\n%x ?", addr);
+        continue;
+      }
+
+      fmt::append(out, "\n%x %s", addr, mem_search_text(mem_search_raw(buf, state.size), state.is_float));
+    }
+
+    return out;
+  }
+
+  return "err unknown command";
+}

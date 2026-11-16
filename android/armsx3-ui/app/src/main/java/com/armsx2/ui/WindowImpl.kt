@@ -32,6 +32,8 @@ enum class InGameScreen {
     Settings, CoreSettings, Achievements, Controls, Skins, Textures, SaveState, LoadState,
     // PS3 trophies for the RUNNING title (the library's Trophies screen, scoped).
     Trophies,
+    // Memory search for custom trophy rules (PocketTrophy).
+    MemorySearch,
     // All Settings' Hotkeys page, from the quick menu's Controller tab.
     Hotkeys,
 }
@@ -133,6 +135,10 @@ object WindowImpl {
                     com.armsx2.ui.touch.TouchControlsOverlay()
                 }
 
+                // Memory search: watched values and filter buttons over the running game
+                // (PocketTrophy). Draws nothing unless switched on from that screen.
+                com.armsx2.ui.trophies.MemoryWatchOverlay()
+
                 // The keys the IME does not have (arrows, Esc, Tab, function row), shown only
                 // while the emulated keyboard is up. Outside the density override above: this
                 // is normal UI and should scale with the UI scale setting, unlike the touch
@@ -228,6 +234,7 @@ object WindowImpl {
                                 key = com.armsx2.ui.emulation.InGameTrophiesVmKey,
                             ),
                         )
+                        InGameScreen.MemorySearch -> com.armsx2.ui.trophies.MemorySearchScreen(onBack = dismiss)
                     }
                 }
             }

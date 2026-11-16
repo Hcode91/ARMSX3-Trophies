@@ -231,6 +231,34 @@ bool TROPUSRLoader::Generate(std::string_view filepath, std::string_view configp
 	return Save(filepath);
 }
 
+bool TROPUSRLoader::SyncWithConfig(std::string_view filepath, std::string_view configpath)
+{
+	const std::vector<TROPUSREntry6> old = m_table6;
+
+	if (!Generate(filepath, configpath))
+	{
+		return false;
+	}
+
+	for (TROPUSREntry6& entry : m_table6)
+	{
+		for (const TROPUSREntry6& before : old)
+		{
+			if (before.trophy_id == entry.trophy_id)
+			{
+				entry.trophy_state = before.trophy_state;
+				entry.unk4 = before.unk4;
+				entry.unk5 = before.unk5;
+				entry.timestamp1 = before.timestamp1;
+				entry.timestamp2 = before.timestamp2;
+				break;
+			}
+		}
+	}
+
+	return Save(filepath);
+}
+
 u32 TROPUSRLoader::GetTrophiesCount() const
 {
 	return ::size32(m_table6);
@@ -249,7 +277,7 @@ u32 TROPUSRLoader::GetUnlockedTrophiesCount() const
 	return count;
 }
 
-u32 TROPUSRLoader::GetUnlockedPlatinumID(u32 trophy_id, const std::string& config_path)
+u32 TROPUSRLoader::GetUnlockedPlatinumID(u32 trophy_id, const std::string& config_path, const std::set<u32>* ignored_ids)
 {
 	constexpr u32 invalid_trophy_id = -1; // SCE_NP_TROPHY_INVALID_TROPHY_ID;
 
@@ -319,6 +347,12 @@ u32 TROPUSRLoader::GetUnlockedPlatinumID(u32 trophy_id, const std::string& confi
 	// The platinum trophy stays locked if any relevant trophy is still locked
 	for (usz i = 0; i < trophy_count; i++)
 	{
+		// Trophies removed by the custom trophy rules do not block the platinum
+		if (ignored_ids && ignored_ids->count(static_cast<u32>(i)))
+		{
+			continue;
+		}
+
 		if (m_table4[i].trophy_pid == pid && !m_table6[i].trophy_state)
 		{
 			return invalid_trophy_id;

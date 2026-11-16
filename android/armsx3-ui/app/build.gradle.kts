@@ -90,11 +90,14 @@ android {
     productFlavors {
         create("github") {
             dimension = "distribution"
+            // PocketTrophy (fork of ARMSX3): its own id, so it installs next to the official
+            // app (and keeps its own data) instead of clashing with it.
+            applicationId = "com.hcode91.pockettrophy"
         }
 
         create("play") {
             dimension = "distribution"
-            applicationId = "com.armsx3.play"
+            applicationId = "com.hcode91.pockettrophy.play"
 
             buildConfigField("boolean", "STORAGE_ALL_FILES", "false")
             buildConfigField("boolean", "IN_APP_UPDATER", "false")
@@ -139,6 +142,17 @@ android {
     // Absent, only the debug key exists and release builds stay sideload-only. The file is
     // gitignored and nothing here echoes its contents.
     signingConfigs {
+        // PocketTrophy: a fixed debug key that lives in the repo. Without it every CI
+        // runner invents its own debug key, so no build could be installed over the previous
+        // one. It is a sideload-only test key, not a secret.
+        getByName("debug") {
+            storeFile = file("trophies-debug.p12")
+            storeType = "PKCS12"
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+
         val props = rootProject.file("keystore.properties")
 
         if (props.exists()) {

@@ -18,11 +18,20 @@
 #include "Emu/NP/np_handler.h"
 
 #include "Utilities/StrUtil.h"
+#include "util/yaml.hpp"
+#include "Emu/Io/pad_types.h"
+#include "Input/pad_thread.h"
 
 #include "Emu/Cell/lv2/sys_event.h"
 #include "Emu/Cell/lv2/sys_fs.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <set>
 #include <functional>
 #include <shared_mutex>
 #include "util/asm.hpp"
@@ -283,6 +292,2377 @@ static void show_trophy_notification(const trophy_context_t* ctxt, s32 trophyId)
 	{
 		trophy_notification_dialog->ShowTrophyNotification(details, trophy_icon_data);
 	}
+}
+
+// ---------------------------------------------------------------------------------------
+// Custom trophy rules (PocketTrophy)
+//
+// An optional rules file lets a trophy pack award trophies from the emulator side, by
+// watching guest memory, instead of patching game code. It can also "remove" trophies
+// (e.g. ones that need long-dead online servers): the game still sees them, but they are
+// never awarded, are hidden from the trophy list and no longer block the platinum.
+//
+// The file is looked up in this order:
+//   /dev_hdd0/home/<user>/trophy_rules/<NPWRxxxxx_00>.yml   (handy while writing rules)
+//   /dev_hdd0/home/<user>/trophy/<NPWRxxxxx_00>/TROPRULES.YML (shipped inside TROPHY.TRP)
+//
+//   game: PPU-becb727c...        # optional: memory rules only run on this executable
+//   original_count: 14           # optional: ids from here on are custom trophies
+//   remove: [5, 9]               # optional
+//   trophies:
+//     14:
+//       when: "[[0xF3F20]+0x48] >= 50"
+//   custom:                      # optional: new trophies, added after the game's own
+//     - name: "Pest Control"
+//       detail: "Kill 14 enemies"
+//       grade: B                 # B, S or G
+//       icon: pest.png           # in trophy_rules/<NPWRxxxxx_00>/, optional
+//       when: "[[0xF3F20]+0x24] >= 14"
+//
+// Without a rules file nothing here changes any behaviour.
+// ---------------------------------------------------------------------------------------
+
+// Problems found while loading a rules file. They go to the log and, so that they can be
+// shown in the app instead of trophies silently going missing, to
+// trophy_rules/<NPWRxxxxx_00>_problems.txt.
+static std::vector<std::string>* s_ct_problems = nullptr;
+
+#define CT_PROBLEM(...) \
+	do \
+	{ \
+		std::string ct_problem_text = fmt::format(__VA_ARGS__); \
+		sceNpTrophy.error("Custom trophy rules: %s", ct_problem_text); \
+		if (s_ct_problems) \
+		{ \
+			s_ct_problems->emplace_back(std::move(ct_problem_text)); \
+		} \
+	} while (0)
+
+enum ct_op_type : u8
+{
+	ct_push,
+	ct_add,
+	ct_sub,
+	ct_mul,
+	ct_and,
+	ct_deref,
+	ct_delta,  // value minus what it was when first read this session
+	ct_prev,   // value at the previous check
+	ct_trophy, // 1 if that trophy id is unlocked, else 0
+	ct_cmp,    // comparison inside brackets, gives 1 or 0
+	ct_count,  // how many times the value went from zero to non-zero (kept between sessions)
+	ct_button, // 1 while that controller button is held
+};
+
+struct ct_op
+{
+	u8 type = ct_push;
+	f64 value = 0;
+	u8 size = 4;
+	bool is_signed = false;
+	bool is_float = false;
+
+	// Remembered between checks by ct_delta and ct_prev
+	f64 state = 0;
+	bool has_state = false;
+	bool flag = false;
+};
+
+enum ct_cmp_type : u8
+{
+	ct_eq,
+	ct_ne,
+	ct_ge,
+	ct_le,
+	ct_gt,
+	ct_lt,
+};
+
+struct ct_condition
+{
+	std::vector<ct_op> lhs;
+	std::vector<ct_op> rhs;
+	u8 cmp = ct_eq;
+	u64 hold_us = 0; // "for 60s": has to stay true this long
+
+	// State
+	u64 held_us = 0;
+	f64 last = 0;         // last value of the left side, for progress display
+	bool readable = false;
+};
+
+using ct_alt = std::vector<ct_condition>; // all of these...
+using ct_clause = std::vector<ct_alt>;    // ...for any one alternative ("||")
+
+struct ct_step
+{
+	std::vector<ct_clause> clauses; // every clause has to hold
+};
+
+struct ct_rule
+{
+	s32 id = -1;
+	std::vector<ct_step> steps; // in order; a plain "when" is a single step
+	ct_step reset;              // optional: sends a sequence back to its first step
+	std::string text;
+
+	// State
+	u32 current = 0;
+	bool all_others = false;   // custom platinum: earned when every other trophy is
+	bool has_progress = false; // simple "value >= target" rules can show progress
+	f64 progress_target = 0;
+	s64 progress_shown = -1;
+};
+
+struct ct_eval_ctx
+{
+	const TROPUSRLoader* tropusr = nullptr;
+	u64 dt_us = 0; // time since the previous check (paused time is not counted)
+};
+
+// A trophy the pack adds on top of the game's own set
+struct ct_custom_trophy
+{
+	std::string name;
+	std::string detail;
+	std::string icon;
+	char grade = 'B';
+	bool hidden = false;
+	bool deleted = false; // keeps its place in the list (so later trophies keep their numbers) but is hidden and cannot be earned
+	ct_rule rule; // id is assigned when the trophy is merged in
+};
+
+struct ct_rules_set
+{
+	std::vector<ct_custom_trophy> custom;
+	u32 defined_trophies = 0; // official + custom, 0 if unknown
+	bool resize_tried = false;
+	u64 last_check = 0;
+	u64 next_progress_write = 0;
+	bool progress_dirty = false;
+	bool fast = false;       // has button(), count() or prev() rules: checked every frame instead of 4x a second
+	bool has_counts = false; // has count() rules: totals are saved to disk
+	f64 saved_counts = -1;
+	u64 next_counts_write = 0;
+	bool loaded = false;
+	bool platinum_checked = false;
+	s32 original_count = -1;
+	std::set<u32> removed;
+	std::vector<ct_rule> rules;
+
+	bool active() const
+	{
+		return !removed.empty() || !rules.empty();
+	}
+
+	bool has_rule(s32 id) const
+	{
+		for (const ct_rule& rule : rules)
+		{
+			if (rule.id == id)
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	// Trophies the real servers know nothing about (or that were not earned the official way)
+	bool is_custom(s32 id) const
+	{
+		return (original_count >= 0 && id >= original_count) || has_rule(id);
+	}
+
+	bool is_removed(s32 id) const
+	{
+		return id >= 0 && removed.count(static_cast<u32>(id)) != 0;
+	}
+};
+
+// Only accessed while sce_np_trophy_manager::mtx is held
+struct custom_trophy_state
+{
+	std::map<std::string, ct_rules_set> sets;
+
+	// The trophy set made for a game without trophies (ct_get_synthetic). Not registered with
+	// idm: the game knows nothing about it, only the rules use it.
+	std::unique_ptr<trophy_context_t> synthetic;
+	bool synthetic_tried = false;
+	std::map<std::string, std::set<s32>> traced; // Trophy ids already written to the trace this session
+
+	custom_trophy_state() = default;
+	custom_trophy_state(const custom_trophy_state&) = delete;
+	custom_trophy_state& operator=(const custom_trophy_state&) = delete;
+};
+
+struct ct_parser
+{
+	std::string_view s;
+	usz pos = 0;
+	std::vector<ct_op>* out = nullptr;
+
+	void skip()
+	{
+		while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t'))
+		{
+			pos++;
+		}
+	}
+
+	bool eat(char c)
+	{
+		skip();
+
+		if (pos < s.size() && s[pos] == c)
+		{
+			pos++;
+			return true;
+		}
+
+		return false;
+	}
+
+	bool at_end()
+	{
+		skip();
+		return pos >= s.size();
+	}
+
+	// expr [compare expr], for use inside brackets: "count([0x1000] > 5)"
+	bool cmp_expr()
+	{
+		if (!expr())
+		{
+			return false;
+		}
+
+		skip();
+
+		const std::string_view rest = s.substr(pos);
+		u8 cmp = ct_eq;
+
+		if (rest.starts_with("=="))
+		{
+			cmp = ct_eq;
+			pos += 2;
+		}
+		else if (rest.starts_with("!="))
+		{
+			cmp = ct_ne;
+			pos += 2;
+		}
+		else if (rest.starts_with(">="))
+		{
+			cmp = ct_ge;
+			pos += 2;
+		}
+		else if (rest.starts_with("<="))
+		{
+			cmp = ct_le;
+			pos += 2;
+		}
+		else if (rest.starts_with(">"))
+		{
+			cmp = ct_gt;
+			pos += 1;
+		}
+		else if (rest.starts_with("<"))
+		{
+			cmp = ct_lt;
+			pos += 1;
+		}
+		else
+		{
+			return true;
+		}
+
+		if (!expr())
+		{
+			return false;
+		}
+
+		ct_op op{};
+		op.type = ct_cmp;
+		op.value = cmp;
+		out->push_back(op);
+		return true;
+	}
+
+	bool expr()
+	{
+		if (!term())
+		{
+			return false;
+		}
+
+		while (true)
+		{
+			u8 type = ct_push;
+
+			if (eat('+'))
+			{
+				type = ct_add;
+			}
+			else if (eat('-'))
+			{
+				type = ct_sub;
+			}
+			else
+			{
+				return true;
+			}
+
+			if (!term())
+			{
+				return false;
+			}
+
+			ct_op op{};
+			op.type = type;
+			out->push_back(op);
+		}
+	}
+
+	bool term()
+	{
+		if (!factor())
+		{
+			return false;
+		}
+
+		while (true)
+		{
+			u8 type = ct_push;
+
+			if (eat('*'))
+			{
+				type = ct_mul;
+			}
+			else if (eat('&'))
+			{
+				type = ct_and;
+			}
+			else
+			{
+				return true;
+			}
+
+			if (!factor())
+			{
+				return false;
+			}
+
+			ct_op op{};
+			op.type = type;
+			out->push_back(op);
+		}
+	}
+
+	bool factor()
+	{
+		skip();
+
+		if (pos >= s.size())
+		{
+			return false;
+		}
+
+		if (eat('('))
+		{
+			return cmp_expr() && eat(')');
+		}
+
+		if (eat('-'))
+		{
+			if (!factor())
+			{
+				return false;
+			}
+
+			ct_op neg{};
+			neg.value = -1;
+			out->push_back(neg);
+
+			ct_op mul{};
+			mul.type = ct_mul;
+			out->push_back(mul);
+			return true;
+		}
+
+		// delta(x), prev(x), trophy(n)
+		static constexpr std::pair<std::string_view, u8> s_funcs[] =
+		{
+			{"delta", ct_delta},
+			{"prev", ct_prev},
+			{"trophy", ct_trophy},
+			{"count", ct_count},
+			{"button", ct_button},
+		};
+
+		for (const auto& [name, type] : s_funcs)
+		{
+			if (s.substr(pos).starts_with(name))
+			{
+				usz next = pos + name.size();
+
+				while (next < s.size() && (s[next] == ' ' || s[next] == '\t'))
+				{
+					next++;
+				}
+
+				if (next < s.size() && s[next] == '(')
+				{
+					pos = next + 1;
+
+					ct_op func{};
+					func.type = type;
+
+					if (type == ct_button)
+					{
+						// button(cross): the argument is a name, not a number
+						skip();
+
+						std::string button;
+
+						while (pos < s.size() && ((s[pos] >= 'a' && s[pos] <= 'z') || (s[pos] >= 'A' && s[pos] <= 'Z') || (s[pos] >= '0' && s[pos] <= '9')))
+						{
+							const char c = s[pos++];
+							button += (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
+						}
+
+						struct button_name
+						{
+							std::string_view name;
+							u8 offset; // 2 = digital1, 3 = digital2
+							u32 code;
+						};
+
+						static constexpr button_name s_buttons[] =
+						{
+							{"select", 2, 0x01}, {"l3", 2, 0x02}, {"r3", 2, 0x04}, {"start", 2, 0x08},
+							{"up", 2, 0x10}, {"right", 2, 0x20}, {"down", 2, 0x40}, {"left", 2, 0x80},
+							{"l2", 3, 0x01}, {"r2", 3, 0x02}, {"l1", 3, 0x04}, {"r1", 3, 0x08},
+							{"triangle", 3, 0x10}, {"circle", 3, 0x20}, {"cross", 3, 0x40}, {"x", 3, 0x40}, {"square", 3, 0x80},
+						};
+
+						bool found = false;
+
+						for (const button_name& entry : s_buttons)
+						{
+							if (button == entry.name)
+							{
+								func.size = entry.offset;
+								func.value = entry.code;
+								found = true;
+								break;
+							}
+						}
+
+						if (!found || !eat(')'))
+						{
+							return false;
+						}
+
+						out->push_back(func);
+						return true;
+					}
+
+					if (!cmp_expr() || !eat(')'))
+					{
+						return false;
+					}
+
+					out->push_back(func);
+					return true;
+				}
+			}
+		}
+
+		ct_op deref{};
+		deref.type = ct_deref;
+
+		struct type_name
+		{
+			std::string_view name;
+			u8 size;
+			bool is_signed;
+			bool is_float;
+		};
+
+		static constexpr type_name s_types[] =
+		{
+			{"u8", 1, false, false},
+			{"s8", 1, true, false},
+			{"u16", 2, false, false},
+			{"s16", 2, true, false},
+			{"u32", 4, false, false},
+			{"s32", 4, true, false},
+			{"f32", 4, false, true},
+		};
+
+		for (const type_name& type : s_types)
+		{
+			if (s.substr(pos).starts_with(type.name))
+			{
+				usz next = pos + type.name.size();
+
+				while (next < s.size() && (s[next] == ' ' || s[next] == '\t'))
+				{
+					next++;
+				}
+
+				if (next < s.size() && s[next] == '[')
+				{
+					pos = next;
+					deref.size = type.size;
+					deref.is_signed = type.is_signed;
+					deref.is_float = type.is_float;
+					break;
+				}
+			}
+		}
+
+		if (eat('['))
+		{
+			if (!expr() || !eat(']'))
+			{
+				return false;
+			}
+
+			out->push_back(deref);
+			return true;
+		}
+
+		// Number: decimal, decimal fraction or 0x hex
+		std::string token;
+
+		while (pos < s.size() && ((s[pos] >= '0' && s[pos] <= '9') || (s[pos] >= 'a' && s[pos] <= 'f') || (s[pos] >= 'A' && s[pos] <= 'F') || s[pos] == 'x' || s[pos] == 'X' || s[pos] == '.'))
+		{
+			token += s[pos++];
+		}
+
+		if (token.empty())
+		{
+			return false;
+		}
+
+		ct_op num{};
+		char* end = nullptr;
+
+		if (token.size() > 2 && token[0] == '0' && (token[1] == 'x' || token[1] == 'X'))
+		{
+			num.value = static_cast<f64>(std::strtoull(token.c_str() + 2, &end, 16));
+		}
+		else
+		{
+			num.value = std::strtod(token.c_str(), &end);
+		}
+
+		if (!end || *end != '\0')
+		{
+			return false;
+		}
+
+		out->push_back(num);
+		return true;
+	}
+};
+
+static bool ct_parse_condition(std::string_view text, ct_condition& cond)
+{
+	ct_parser parser{};
+	parser.s = text;
+	parser.out = &cond.lhs;
+
+	if (!parser.expr())
+	{
+		return false;
+	}
+
+	parser.skip();
+
+	const std::string_view rest = parser.s.substr(parser.pos);
+
+	if (rest.starts_with("=="))
+	{
+		cond.cmp = ct_eq;
+		parser.pos += 2;
+	}
+	else if (rest.starts_with("!="))
+	{
+		cond.cmp = ct_ne;
+		parser.pos += 2;
+	}
+	else if (rest.starts_with(">="))
+	{
+		cond.cmp = ct_ge;
+		parser.pos += 2;
+	}
+	else if (rest.starts_with("<="))
+	{
+		cond.cmp = ct_le;
+		parser.pos += 2;
+	}
+	else if (rest.starts_with(">"))
+	{
+		cond.cmp = ct_gt;
+		parser.pos += 1;
+	}
+	else if (rest.starts_with("<"))
+	{
+		cond.cmp = ct_lt;
+		parser.pos += 1;
+	}
+	else if (rest.starts_with("="))
+	{
+		cond.cmp = ct_eq;
+		parser.pos += 1;
+	}
+	else
+	{
+		return false;
+	}
+
+	parser.out = &cond.rhs;
+
+	if (!parser.expr())
+	{
+		return false;
+	}
+
+	// Optional "for 60s" / "for 2m": the comparison has to stay true that long
+	parser.skip();
+
+	if (const std::string_view tail = parser.s.substr(parser.pos); tail.starts_with("for ") || tail.starts_with("for\t"))
+	{
+		parser.pos += 3;
+		parser.skip();
+
+		std::string number;
+
+		while (parser.pos < parser.s.size() && ((parser.s[parser.pos] >= '0' && parser.s[parser.pos] <= '9') || parser.s[parser.pos] == '.'))
+		{
+			number += parser.s[parser.pos++];
+		}
+
+		char* end = nullptr;
+		const f64 amount = number.empty() ? -1.0 : std::strtod(number.c_str(), &end);
+
+		if (amount < 0 || !end || *end != '\0' || amount > 86400.0)
+		{
+			return false;
+		}
+
+		f64 seconds = amount;
+
+		if (parser.eat('m'))
+		{
+			seconds = parser.eat('s') ? amount / 1000.0 : amount * 60.0;
+		}
+		else
+		{
+			parser.eat('s');
+		}
+
+		cond.hold_us = static_cast<u64>(seconds * 1'000'000.0);
+	}
+
+	return parser.at_end();
+}
+
+// Evaluate against guest memory. Fails (false) if anything points at unmapped memory.
+static bool ct_eval(std::vector<ct_op>& ops, const ct_eval_ctx& ctx, f64& result)
+{
+	f64 stack[16]{};
+	u32 sp = 0;
+
+	for (ct_op& op : ops)
+	{
+		switch (op.type)
+		{
+		case ct_push:
+		{
+			if (sp >= std::size(stack))
+			{
+				return false;
+			}
+
+			stack[sp++] = op.value;
+			break;
+		}
+		case ct_add:
+		case ct_sub:
+		case ct_mul:
+		case ct_and:
+		{
+			if (sp < 2)
+			{
+				return false;
+			}
+
+			const f64 b = stack[--sp];
+			const f64 a = stack[sp - 1];
+
+			if (op.type == ct_add)
+			{
+				stack[sp - 1] = a + b;
+			}
+			else if (op.type == ct_sub)
+			{
+				stack[sp - 1] = a - b;
+			}
+			else if (op.type == ct_mul)
+			{
+				stack[sp - 1] = a * b;
+			}
+			else
+			{
+				if (!(a >= -9.0e15 && a <= 9.0e15 && b >= -9.0e15 && b <= 9.0e15))
+				{
+					return false;
+				}
+
+				stack[sp - 1] = static_cast<f64>(static_cast<s64>(a) & static_cast<s64>(b));
+			}
+
+			break;
+		}
+		case ct_deref:
+		{
+			if (sp < 1)
+			{
+				return false;
+			}
+
+			const f64 a = stack[sp - 1];
+
+			if (!(a >= 65536.0 && a <= 4294967295.0))
+			{
+				// Also treats null (and near-null) pointers as "not there yet"
+				return false;
+			}
+
+			const u32 addr = static_cast<u32>(a);
+			u8 buf[4]{};
+
+			if (op.size < 1 || op.size > 4 || !vm::try_access(addr, buf, op.size, false))
+			{
+				return false;
+			}
+
+			if (op.size == 1)
+			{
+				stack[sp - 1] = op.is_signed ? static_cast<f64>(static_cast<s8>(buf[0])) : static_cast<f64>(buf[0]);
+			}
+			else if (op.size == 2)
+			{
+				const u16 v = static_cast<u16>((buf[0] << 8) | buf[1]);
+				stack[sp - 1] = op.is_signed ? static_cast<f64>(static_cast<s16>(v)) : static_cast<f64>(v);
+			}
+			else
+			{
+				const u32 v = (u32{buf[0]} << 24) | (u32{buf[1]} << 16) | (u32{buf[2]} << 8) | u32{buf[3]};
+
+				if (op.is_float)
+				{
+					f32 f = 0;
+					std::memcpy(&f, &v, sizeof(f));
+					stack[sp - 1] = f;
+				}
+				else
+				{
+					stack[sp - 1] = op.is_signed ? static_cast<f64>(static_cast<s32>(v)) : static_cast<f64>(v);
+				}
+			}
+
+			break;
+		}
+		case ct_button:
+		{
+			if (sp >= std::size(stack))
+			{
+				return false;
+			}
+
+			bool pressed = false;
+
+			{
+				std::lock_guard pad_lock(pad::g_pad_mutex);
+
+				if (const auto handler = pad::get_pad_thread(true))
+				{
+					if (const auto& pad = handler->GetPads()[0])
+					{
+						for (const Button& button : pad->m_buttons)
+						{
+							if (button.m_pressed && button.m_offset == op.size && button.m_outKeyCode == static_cast<u32>(op.value))
+							{
+								pressed = true;
+								break;
+							}
+						}
+					}
+				}
+			}
+
+			stack[sp++] = pressed ? 1 : 0;
+			break;
+		}
+		case ct_cmp:
+		{
+			if (sp < 2)
+			{
+				return false;
+			}
+
+			const f64 b = stack[--sp];
+			const f64 a = stack[sp - 1];
+			bool ok = false;
+
+			switch (static_cast<u8>(op.value))
+			{
+			case ct_eq: ok = a == b; break;
+			case ct_ne: ok = a != b; break;
+			case ct_ge: ok = a >= b; break;
+			case ct_le: ok = a <= b; break;
+			case ct_gt: ok = a > b; break;
+			case ct_lt: ok = a < b; break;
+			default: break;
+			}
+
+			stack[sp - 1] = ok ? 1 : 0;
+			break;
+		}
+		case ct_count:
+		{
+			if (sp < 1)
+			{
+				return false;
+			}
+
+			const bool truthy = stack[sp - 1] != 0;
+
+			if (truthy && !op.flag)
+			{
+				op.state += 1;
+			}
+
+			op.flag = truthy;
+			stack[sp - 1] = op.state;
+			break;
+		}
+		case ct_delta:
+		case ct_prev:
+		case ct_trophy:
+		{
+			if (sp < 1)
+			{
+				return false;
+			}
+
+			const f64 a = stack[sp - 1];
+
+			if (op.type == ct_delta)
+			{
+				if (!op.has_state)
+				{
+					op.state = a;
+					op.has_state = true;
+				}
+
+				stack[sp - 1] = a - op.state;
+			}
+			else if (op.type == ct_prev)
+			{
+				stack[sp - 1] = op.has_state ? op.state : a;
+				op.state = a;
+				op.has_state = true;
+			}
+			else
+			{
+				const bool unlocked = ctx.tropusr && a >= 0 && a < ctx.tropusr->GetTrophiesCount() && ctx.tropusr->GetTrophyUnlockState(static_cast<u32>(a));
+				stack[sp - 1] = unlocked ? 1 : 0;
+			}
+
+			break;
+		}
+		default:
+		{
+			return false;
+		}
+		}
+	}
+
+	if (sp != 1 || stack[0] != stack[0])
+	{
+		return false;
+	}
+
+	result = stack[0];
+	return true;
+}
+
+static bool ct_check(ct_condition& cond, const ct_eval_ctx& ctx)
+{
+	f64 a = 0;
+	f64 b = 0;
+
+	// Both sides are always evaluated so that prev() and delta() see every check
+	const bool read_a = ct_eval(cond.lhs, ctx, a);
+	const bool read_b = ct_eval(cond.rhs, ctx, b);
+
+	cond.readable = read_a;
+	cond.last = a;
+
+	bool ok = false;
+
+	if (read_a && read_b)
+	{
+		switch (cond.cmp)
+		{
+		case ct_eq: ok = a == b; break;
+		case ct_ne: ok = a != b; break;
+		case ct_ge: ok = a >= b; break;
+		case ct_le: ok = a <= b; break;
+		case ct_gt: ok = a > b; break;
+		case ct_lt: ok = a < b; break;
+		default: break;
+		}
+	}
+
+	if (!ok)
+	{
+		cond.held_us = 0;
+		return false;
+	}
+
+	if (!cond.hold_us)
+	{
+		return true;
+	}
+
+	cond.held_us += ctx.dt_us;
+	return cond.held_us >= cond.hold_us;
+}
+
+static bool ct_check_step(ct_step& step, const ct_eval_ctx& ctx)
+{
+	bool all = !step.clauses.empty();
+
+	for (ct_clause& clause : step.clauses)
+	{
+		bool any = false;
+
+		for (ct_alt& alt : clause)
+		{
+			bool alt_ok = !alt.empty();
+
+			for (ct_condition& cond : alt)
+			{
+				// No early exit, see ct_check
+				if (!ct_check(cond, ctx))
+				{
+					alt_ok = false;
+				}
+			}
+
+			any |= alt_ok;
+		}
+
+		all &= any;
+	}
+
+	return all;
+}
+
+static bool ct_test(ct_rule& rule, const ct_eval_ctx& ctx)
+{
+	if (rule.steps.empty())
+	{
+		return false;
+	}
+
+	if (!rule.reset.clauses.empty() && ct_check_step(rule.reset, ctx))
+	{
+		// Back to the start, and nothing counts while the reset condition holds
+		rule.current = 0;
+		return false;
+	}
+
+	if (rule.current < rule.steps.size() && ct_check_step(rule.steps[rule.current], ctx))
+	{
+		rule.current++;
+	}
+
+	return rule.current >= rule.steps.size();
+}
+
+static bool ct_parse_int(const std::string& text, s32& out)
+{
+	if (text.empty())
+	{
+		return false;
+	}
+
+	char* end = nullptr;
+	const bool hex = text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X');
+	const long value = hex ? std::strtol(text.c_str() + 2, &end, 16) : std::strtol(text.c_str(), &end, 10);
+
+	if (!end || *end != '\0' || value < 0 || value > 0xffff)
+	{
+		return false;
+	}
+
+	out = static_cast<s32>(value);
+	return true;
+}
+
+// One clause: "a && b || c && d" (and binds tighter than or)
+static void ct_add_clause(ct_step& step, s32 id, const std::string& text, bool& valid)
+{
+	ct_clause clause;
+
+	for (const std::string& alt_text : fmt::split(text, {"||"}))
+	{
+		ct_alt alt;
+
+		for (const std::string& part : fmt::split(alt_text, {"&&"}))
+		{
+			ct_condition cond{};
+
+			if (!ct_parse_condition(part, cond))
+			{
+				CT_PROBLEM("trophy %d: cannot understand condition '%s'", id, part);
+				valid = false;
+				return;
+			}
+
+			alt.emplace_back(std::move(cond));
+		}
+
+		if (!alt.empty())
+		{
+			clause.emplace_back(std::move(alt));
+		}
+	}
+
+	if (!clause.empty())
+	{
+		step.clauses.emplace_back(std::move(clause));
+	}
+}
+
+// Reads "when" (one step), "steps" (a sequence) and "reset" from a rule entry.
+// A bare string or list is taken as "when". Returns false if the rule is unusable.
+static bool ct_parse_rule(const YAML::Node& value, ct_rule& rule)
+{
+	bool valid = true;
+
+	const auto add_step = [&](const YAML::Node& node, ct_step& step, std::string& text)
+	{
+		const auto add = [&](const std::string& clause)
+		{
+			ct_add_clause(step, rule.id, clause, valid);
+
+			if (!text.empty())
+			{
+				text += " && ";
+			}
+
+			text += clause.find("||") != umax ? "(" + clause + ")" : clause;
+		};
+
+		if (node.IsScalar())
+		{
+			add(node.Scalar());
+		}
+		else if (node.IsSequence())
+		{
+			for (const auto& item : node)
+			{
+				if (valid && item.IsScalar())
+				{
+					add(item.Scalar());
+				}
+			}
+		}
+	};
+
+	const auto add_whole_step = [&](const YAML::Node& node)
+	{
+		ct_step step;
+		std::string text;
+		add_step(node, step, text);
+
+		if (!step.clauses.empty())
+		{
+			if (!rule.steps.empty())
+			{
+				rule.text += " THEN ";
+			}
+
+			rule.text += text;
+			rule.steps.emplace_back(std::move(step));
+		}
+	};
+
+	if (value.IsMap())
+	{
+		if (const YAML::Node when = value["when"]; when)
+		{
+			add_whole_step(when);
+		}
+
+		if (const YAML::Node steps = value["steps"]; steps && steps.IsSequence())
+		{
+			for (const auto& item : steps)
+			{
+				add_whole_step(item);
+			}
+		}
+
+		if (const YAML::Node reset = value["reset"]; reset)
+		{
+			std::string text;
+			add_step(reset, rule.reset, text);
+
+			if (!text.empty())
+			{
+				rule.text += " (RESET IF " + text + ")";
+			}
+		}
+	}
+	else
+	{
+		add_whole_step(value);
+	}
+
+	if (!valid || rule.steps.empty())
+	{
+		return false;
+	}
+
+	// "value >= 50" on its own can be shown as progress
+	if (rule.steps.size() == 1 && rule.steps[0].clauses.size() == 1 && rule.steps[0].clauses[0].size() == 1 && rule.steps[0].clauses[0][0].size() == 1)
+	{
+		const ct_condition& cond = rule.steps[0].clauses[0][0][0];
+
+		if ((cond.cmp == ct_ge || cond.cmp == ct_gt) && !cond.hold_us && cond.rhs.size() == 1 && cond.rhs[0].type == ct_push && cond.rhs[0].value >= 1)
+		{
+			rule.has_progress = true;
+			rule.progress_target = cond.rhs[0].value;
+		}
+	}
+
+	return true;
+}
+
+static void ct_load(ct_rules_set& set, const std::string& trp_name)
+{
+	set = {};
+	set.loaded = true;
+
+	const std::string home = "/dev_hdd0/home/" + Emu.GetUsr();
+	const std::string paths[] =
+	{
+		vfs::get(home + "/trophy_rules/" + trp_name + ".yml"),
+		vfs::get(home + "/trophy/" + trp_name + "/TROPRULES.YML"),
+	};
+
+	std::string text;
+	std::string used_path;
+
+	for (const std::string& path : paths)
+	{
+		if (path.empty())
+		{
+			continue;
+		}
+
+		if (fs::file file{path})
+		{
+			text = file.to_string();
+			used_path = path;
+			break;
+		}
+	}
+
+	if (used_path.empty())
+	{
+		return;
+	}
+
+	// Note: the core is built without C++ exceptions, so only non-throwing yaml-cpp calls are used here
+	const auto loaded = yaml_load(text);
+	const YAML::Node& root = loaded.first;
+
+	if (!loaded.second.empty() || !root.IsMap())
+	{
+		CT_PROBLEM("failed to read '%s': %s", used_path, loaded.second);
+		return;
+	}
+
+	if (const YAML::Node node = root["original_count"]; node && node.IsScalar())
+	{
+		s32 value = -1;
+
+		if (ct_parse_int(node.Scalar(), value))
+		{
+			set.original_count = value;
+		}
+	}
+
+	if (const YAML::Node node = root["remove"]; node && node.IsSequence())
+	{
+		for (const auto& entry : node)
+		{
+			s32 value = -1;
+
+			if (entry.IsScalar() && ct_parse_int(entry.Scalar(), value))
+			{
+				set.removed.insert(static_cast<u32>(value));
+			}
+		}
+	}
+
+	bool rules_allowed = true;
+
+	if (const YAML::Node node = root["game"]; node && node.IsScalar())
+	{
+		const std::string wanted = node.Scalar();
+		const std::string& actual = Emu.GetExecutableHash();
+
+		if (!wanted.empty() && wanted != actual)
+		{
+			CT_PROBLEM("'%s' is for %s but this game is %s. Memory rules are disabled.", used_path, wanted, actual);
+			rules_allowed = false;
+		}
+	}
+
+	if (const YAML::Node node = root["trophies"]; rules_allowed && node && node.IsMap())
+	{
+		for (const auto& entry : node)
+		{
+			ct_rule rule{};
+
+			if (!entry.first.IsScalar() || !ct_parse_int(entry.first.Scalar(), rule.id))
+			{
+				CT_PROBLEM("bad trophy id in '%s'", used_path);
+				continue;
+			}
+
+			if (!ct_parse_rule(entry.second, rule) || set.is_removed(rule.id))
+			{
+				continue;
+			}
+
+			sceNpTrophy.notice("Custom trophy rules: trophy %d when %s", rule.id, rule.text);
+			set.rules.emplace_back(std::move(rule));
+		}
+	}
+
+	if (const YAML::Node node = root["custom"]; node && node.IsSequence())
+	{
+		for (const auto& entry : node)
+		{
+			if (!entry.IsMap())
+			{
+				continue;
+			}
+
+			const YAML::Node& value = entry;
+			ct_custom_trophy trophy{};
+
+			if (const YAML::Node n = value["name"]; n && n.IsScalar())
+			{
+				trophy.name = n.Scalar();
+			}
+
+			if (const YAML::Node n = value["detail"]; n && n.IsScalar())
+			{
+				trophy.detail = n.Scalar();
+			}
+
+			if (const YAML::Node n = value["icon"]; n && n.IsScalar())
+			{
+				trophy.icon = n.Scalar();
+			}
+
+			if (const YAML::Node n = value["grade"]; n && n.IsScalar() && !n.Scalar().empty())
+			{
+				const char grade = n.Scalar()[0];
+				trophy.grade = (grade == 'P' || grade == 'p') ? 'P' : (grade == 'G' || grade == 'g') ? 'G' : (grade == 'S' || grade == 's') ? 'S' : 'B';
+			}
+
+			if (const YAML::Node n = value["hidden"]; n && n.IsScalar())
+			{
+				trophy.hidden = n.Scalar() == "true" || n.Scalar() == "yes";
+			}
+
+			if (const YAML::Node n = value["deleted"]; n && n.IsScalar())
+			{
+				trophy.deleted = n.Scalar() == "true" || n.Scalar() == "yes";
+			}
+
+			if (trophy.deleted && trophy.name.empty())
+			{
+				trophy.name = "Removed trophy";
+			}
+
+			if (trophy.name.empty())
+			{
+				CT_PROBLEM("a custom trophy in '%s' has no name, skipping", used_path);
+				continue;
+			}
+
+			if (trophy.deleted || trophy.grade == 'P')
+			{
+				// No rule to read: a deleted trophy only holds its place, and a platinum is
+				// earned by unlocking every other trophy
+			}
+			else if (rules_allowed && !ct_parse_rule(value, trophy.rule))
+			{
+				CT_PROBLEM("'%s' has a rule that cannot be understood, so it cannot be earned yet", trophy.name);
+				// Keep the trophy, it just cannot be earned until the rule is fixed
+				trophy.rule = {};
+			}
+
+			set.custom.emplace_back(std::move(trophy));
+		}
+	}
+
+	sceNpTrophy.success("Custom trophy rules: loaded '%s' (%d rules, %d removed, %d custom trophies)", used_path, set.rules.size(), set.removed.size(), set.custom.size());
+}
+
+static std::string ct_xml_escape(const std::string& text)
+{
+	std::string out;
+
+	for (const char c : text)
+	{
+		switch (c)
+		{
+		case '&': out += "&amp;"; break;
+		case '<': out += "&lt;"; break;
+		case '>': out += "&gt;"; break;
+		case '"': out += "&quot;"; break;
+		default: out += c; break;
+		}
+	}
+
+	return out;
+}
+
+// Adds the pack's custom trophies to the freshly installed trophy data: the definitions go
+// into the .SFM files, the icons next to the game's own, and their rules get their ids.
+// Returns the total number of trophies now defined (0 if the config could not be read).
+// The game's TROPHY.TRP itself is never modified.
+static u32 ct_merge_custom(ct_rules_set& set, const std::string& trp_name)
+{
+	static constexpr std::string_view s_marker = "<!--custom-trophies-->";
+	static constexpr std::string_view s_end = "</trophyconf>";
+
+	const std::string home = "/dev_hdd0/home/" + Emu.GetUsr();
+	const std::string dir = vfs::get(home + "/trophy/" + trp_name + "/");
+	const std::string icon_dir = vfs::get(home + "/trophy_rules/" + trp_name + "/");
+
+	const auto read_clean = [&](const std::string& path, std::string& text)
+	{
+		fs::file file{path};
+
+		if (!file)
+		{
+			return false;
+		}
+
+		text = file.to_string();
+
+		// Drop anything a previous merge left behind
+		if (const usz mark = text.find(s_marker); mark != umax)
+		{
+			if (const usz end = text.find(s_end, mark); end != umax)
+			{
+				text.erase(mark, end - mark);
+			}
+		}
+
+		return true;
+	};
+
+	std::string conf;
+
+	if (dir.empty() || !read_clean(dir + "TROPCONF.SFM", conf))
+	{
+		return 0;
+	}
+
+	// Official trophies: highest id + 1
+	u32 count = 0;
+
+	for (usz pos = 0; (pos = conf.find("<trophy id=\"", pos)) != umax; pos += 12)
+	{
+		const long id = std::strtol(conf.c_str() + pos + 12, nullptr, 10);
+
+		if (id >= 0 && id < 0x10000)
+		{
+			count = std::max<u32>(count, static_cast<u32>(id) + 1);
+		}
+	}
+
+	// A set the emulator made for a game without trophies (ct_get_synthetic) starts with none
+	if (set.custom.empty())
+	{
+		return count;
+	}
+
+	if (count + set.custom.size() > 128)
+	{
+		CT_PROBLEM("too many custom trophies (a set can hold 128 in total)");
+		return count;
+	}
+
+	if (set.original_count < 0)
+	{
+		set.original_count = static_cast<s32>(count);
+	}
+
+	// A set can only have one platinum
+	const bool has_platinum = conf.find("ttype=\"P\"") != umax;
+	bool custom_platinum = false;
+
+	for (ct_custom_trophy& trophy : set.custom)
+	{
+		if (trophy.grade != 'P' || trophy.deleted)
+		{
+			continue;
+		}
+
+		if (has_platinum || custom_platinum)
+		{
+			CT_PROBLEM("'%s' cannot be a platinum: this trophy set already has one. It is hidden.", trophy.name);
+			trophy.deleted = true;
+			trophy.grade = 'G';
+			continue;
+		}
+
+		custom_platinum = true;
+	}
+
+	std::string blocks{s_marker};
+	blocks += '\n';
+
+	for (usz i = 0; i < set.custom.size(); i++)
+	{
+		ct_custom_trophy& trophy = set.custom[i];
+		const u32 id = count + static_cast<u32>(i);
+
+		fmt::append(blocks, " <trophy id=\"%03u\" hidden=\"%s\" ttype=\"%s\" pid=\"-1\">\n  <name>%s</name>\n  <detail>%s</detail>\n </trophy>\n",
+			id, trophy.hidden ? "yes" : "no", std::string(1, trophy.grade), ct_xml_escape(trophy.name), ct_xml_escape(trophy.detail));
+
+		// Icon: the pack's own if it has one, otherwise the game's icon
+		const std::string dst = dir + fmt::format("TROP%03u.PNG", id);
+		const bool safe_name = !trophy.icon.empty() && trophy.icon.find('/') == umax && trophy.icon.find('\\') == umax && trophy.icon.find("..") == umax;
+
+		if (!safe_name || icon_dir.empty() || !fs::copy_file(icon_dir + trophy.icon, dst, true))
+		{
+			if (!fs::copy_file(dir + "ICON0.PNG", dst, true))
+			{
+				sceNpTrophy.warning("Custom trophy rules: no icon for custom trophy %d", id);
+			}
+		}
+
+		if (trophy.deleted)
+		{
+			set.removed.insert(id);
+		}
+		else if (trophy.grade == 'P')
+		{
+			ct_rule rule{};
+			rule.id = static_cast<s32>(id);
+			rule.all_others = true;
+			rule.text = "every other trophy is unlocked";
+			sceNpTrophy.notice("Custom trophy rules: custom platinum %d '%s'", id, trophy.name);
+			set.rules.emplace_back(std::move(rule));
+		}
+		else if (!trophy.rule.steps.empty())
+		{
+			ct_rule rule = trophy.rule;
+			rule.id = static_cast<s32>(id);
+			sceNpTrophy.notice("Custom trophy rules: custom trophy %d '%s' when %s", id, trophy.name, rule.text);
+			set.rules.emplace_back(std::move(rule));
+		}
+		else
+		{
+			sceNpTrophy.warning("Custom trophy rules: custom trophy %d '%s' has no usable rule, it cannot be earned", id, trophy.name);
+		}
+	}
+
+	// The same definitions go into every config file that was installed
+	std::vector<std::string> names{"TROPCONF.SFM", "TROP.SFM"};
+
+	for (u32 i = 0; i <= 18; i++)
+	{
+		names.emplace_back(fmt::format("TROP_%02d.SFM", i));
+	}
+
+	bool conf_written = false;
+
+	for (const std::string& name : names)
+	{
+		std::string text;
+
+		if (!read_clean(dir + name, text))
+		{
+			continue;
+		}
+
+		const usz end = text.rfind(s_end);
+
+		if (end == umax)
+		{
+			continue;
+		}
+
+		text.insert(end, blocks);
+
+		if (fs::file out{dir + name, fs::rewrite}; out && out.write(text.data(), text.size()) == text.size())
+		{
+			conf_written |= name == "TROPCONF.SFM";
+		}
+		else
+		{
+			CT_PROBLEM("failed to update %s", name);
+		}
+	}
+
+	if (!conf_written)
+	{
+		// Without the definitions the rules must not run either
+		std::erase_if(set.rules, [&](const ct_rule& rule) { return rule.id >= static_cast<s32>(count); });
+		return count;
+	}
+
+	sceNpTrophy.success("Custom trophy rules: added %d custom trophies after the game's %d", set.custom.size(), count);
+	return count + static_cast<u32>(set.custom.size());
+}
+
+// Tells the trophy list (which reads the trophy folder directly) which ids to leave out
+static void ct_write_hidden(const ct_rules_set& set, const std::string& trp_name)
+{
+	const std::string dir = vfs::get("/dev_hdd0/home/" + Emu.GetUsr() + "/trophy/" + trp_name + "/");
+
+	if (dir.empty() || set.removed.empty())
+	{
+		return;
+	}
+
+	std::string text;
+
+	for (const u32 id : set.removed)
+	{
+		fmt::append(text, "%u\n", id);
+	}
+
+	if (fs::file out{dir + "TROPHIDE.TXT", fs::rewrite})
+	{
+		out.write(text.data(), text.size());
+	}
+}
+
+// For the memory search's watch list: the current value of an expression such as
+// "u16[[[0x1f6a00]+0xf4]+0x4]". False if it cannot be parsed or read right now.
+bool sceNpTrophy_eval_expression(std::string_view text, f64& result)
+{
+	std::vector<ct_op> ops;
+
+	ct_parser parser{};
+	parser.s = text;
+	parser.out = &ops;
+
+	if (!parser.cmp_expr() || !parser.at_end())
+	{
+		return false;
+	}
+
+	for (const ct_op& op : ops)
+	{
+		// These need state or a trophy context, which a one-off read does not have
+		if (op.type == ct_delta || op.type == ct_prev || op.type == ct_count || op.type == ct_trophy)
+		{
+			return false;
+		}
+	}
+
+	return ct_eval(ops, ct_eval_ctx{}, result);
+}
+
+// Calls func(rule id, op) for every operation of every rule, always in the same order
+template <typename F>
+static void ct_for_each_op(ct_rules_set& set, F&& func)
+{
+	const auto walk_step = [&](s32 id, ct_step& step)
+	{
+		for (ct_clause& clause : step.clauses)
+		{
+			for (ct_alt& alt : clause)
+			{
+				for (ct_condition& cond : alt)
+				{
+					for (ct_op& op : cond.lhs)
+					{
+						func(id, op);
+					}
+
+					for (ct_op& op : cond.rhs)
+					{
+						func(id, op);
+					}
+				}
+			}
+		}
+	};
+
+	for (ct_rule& rule : set.rules)
+	{
+		for (ct_step& step : rule.steps)
+		{
+			walk_step(rule.id, step);
+		}
+
+		walk_step(rule.id, rule.reset);
+	}
+}
+
+static std::string ct_counts_path(const std::string& trp_name)
+{
+	return vfs::get("/dev_hdd0/home/" + Emu.GetUsr() + "/trophy_rules/" + trp_name + "_counts.txt");
+}
+
+// count() totals survive restarts. One line per counter: "<trophy id> <nth count() of that rule> <total>"
+static void ct_load_counts(ct_rules_set& set, const std::string& trp_name)
+{
+	set.fast = false;
+	set.has_counts = false;
+
+	std::map<std::pair<s32, u32>, f64> saved;
+
+	if (fs::file file{ct_counts_path(trp_name)})
+	{
+		for (const std::string& line : fmt::split(file.to_string(), {"\n", "\r"}))
+		{
+			int id = 0;
+			unsigned index = 0;
+			double total = 0;
+
+			if (std::sscanf(line.c_str(), "%d %u %lf", &id, &index, &total) == 3 && total >= 0)
+			{
+				saved[{id, index}] = total;
+			}
+		}
+	}
+
+	s32 last_id = -1;
+	u32 index = 0;
+	f64 sum = 0;
+
+	ct_for_each_op(set, [&](s32 id, ct_op& op)
+	{
+		if (id != last_id)
+		{
+			last_id = id;
+			index = 0;
+		}
+
+		if (op.type == ct_button || op.type == ct_prev)
+		{
+			// Presses and changes can be over within a frame or two
+			set.fast = true;
+		}
+		else if (op.type == ct_count)
+		{
+			set.fast = true;
+			set.has_counts = true;
+
+			if (const auto found = saved.find({id, index}); found != saved.end())
+			{
+				op.state = found->second;
+			}
+
+			sum += op.state;
+			index++;
+		}
+	});
+
+	set.saved_counts = sum;
+}
+
+static void ct_save_counts(ct_rules_set& set, const std::string& trp_name)
+{
+	std::string text;
+	s32 last_id = -1;
+	u32 index = 0;
+	f64 sum = 0;
+
+	ct_for_each_op(set, [&](s32 id, ct_op& op)
+	{
+		if (id != last_id)
+		{
+			last_id = id;
+			index = 0;
+		}
+
+		if (op.type == ct_count)
+		{
+			fmt::append(text, "%d %u %d\n", id, index, static_cast<s64>(op.state));
+			sum += op.state;
+			index++;
+		}
+	});
+
+	if (sum == set.saved_counts)
+	{
+		return;
+	}
+
+	const std::string path = ct_counts_path(trp_name);
+
+	if (fs::create_path(fs::get_parent_dir(path)))
+	{
+		if (fs::file out{path, fs::rewrite})
+		{
+			out.write(text.data(), text.size());
+			set.saved_counts = sum;
+		}
+	}
+}
+
+// Must be called with sce_np_trophy_manager::mtx held
+static ct_rules_set& ct_get_rules(const std::string& trp_name, bool reload = false)
+{
+	ct_rules_set& set = g_fxo->get<custom_trophy_state>().sets[trp_name];
+
+	if (reload || !set.loaded)
+	{
+		std::vector<std::string> problems;
+		s_ct_problems = &problems;
+
+		ct_load(set, trp_name);
+
+		// Also done when a savestate skipped sceNpTrophyRegisterContext; merging twice is harmless
+		set.defined_trophies = ct_merge_custom(set, trp_name);
+		ct_write_hidden(set, trp_name);
+		ct_load_counts(set, trp_name);
+
+		s_ct_problems = nullptr;
+
+		// Tell the app what went wrong (or that nothing did)
+		const std::string problems_path = vfs::get("/dev_hdd0/home/" + Emu.GetUsr() + "/trophy_rules/" + trp_name + "_problems.txt");
+
+		if (problems.empty())
+		{
+			fs::remove_file(problems_path);
+		}
+		else if (fs::file out{problems_path, fs::rewrite})
+		{
+			std::string text;
+
+			for (const std::string& problem : problems)
+			{
+				text += problem;
+				text += '\n';
+			}
+
+			out.write(text.data(), text.size());
+		}
+	}
+
+	return set;
+}
+
+// Trophy tracer: records which game code asked for a trophy, once per trophy and session.
+// The addresses are where to start looking (in the decrypted EBOOT) for the values that the
+// game checks, i.e. the raw material for writing custom trophy rules.
+// Written to the log and to home/<user>/trophy_rules/<NPWRxxxxx_00>_trace.txt.
+// Must be called with sce_np_trophy_manager::mtx held, on the PPU thread that made the request.
+static void ct_trace_request(ppu_thread& ppu, const trophy_context_t* ctxt, s32 trophyId, bool already_unlocked)
+{
+	if (!g_fxo->get<custom_trophy_state>().traced[ctxt->trp_name].insert(trophyId).second)
+	{
+		return;
+	}
+
+	// The game called the import stub from here
+	std::string chain = fmt::format("0x%x", static_cast<u32>(ppu.lr) - 4);
+
+	// Walk the PPC64 stack: [sp] is the caller's frame, its saved LR is at +16
+	u32 sp = static_cast<u32>(ppu.gpr[1]);
+
+	for (u32 depth = 0; depth < 8; depth++)
+	{
+		be_t<u64> back{};
+
+		if (!vm::try_access(sp, &back, sizeof(back), false))
+		{
+			break;
+		}
+
+		const u32 next = static_cast<u32>(back.value());
+
+		if (next <= sp)
+		{
+			break;
+		}
+
+		be_t<u64> saved_lr{};
+
+		if (!vm::try_access(next + 16, &saved_lr, sizeof(saved_lr), false))
+		{
+			break;
+		}
+
+		const u32 ret = static_cast<u32>(saved_lr.value());
+
+		if (ret < 0x10000)
+		{
+			break;
+		}
+
+		fmt::append(chain, " <- 0x%x", ret - 4);
+		sp = next;
+	}
+
+	const std::string line = fmt::format("trophy %d%s: requested from %s (r4=0x%x r5=0x%x r6=0x%x)", trophyId, already_unlocked ? " (already unlocked)" : "", chain, static_cast<u32>(ppu.gpr[4]), static_cast<u32>(ppu.gpr[5]), static_cast<u32>(ppu.gpr[6]));
+
+	sceNpTrophy.success("Trophy trace: %s", line);
+
+	const std::string dir = vfs::get("/dev_hdd0/home/" + Emu.GetUsr() + "/trophy_rules/");
+
+	if (dir.empty() || !fs::create_path(dir))
+	{
+		return;
+	}
+
+	const std::string path = dir + ctxt->trp_name + "_trace.txt";
+	const bool is_new = !fs::is_file(path);
+
+	if (fs::file file{path, fs::write + fs::create + fs::append})
+	{
+		if (is_new)
+		{
+			file.write(fmt::format("# Trophy trace for %s\n# game: %s (%s)\n# Each line: the game code that asked for the trophy, innermost call first.\n", ctxt->trp_name, Emu.GetExecutableHash(), Emu.GetTitleID()));
+		}
+
+		file.write(line + "\n");
+	}
+}
+
+// Shared by the game's own unlock requests and by the custom rules.
+// Must be called with sce_np_trophy_manager::mtx held, on a PPU thread.
+// With unlock_self=false only the platinum linked to trophyId is (re)checked.
+// Returns the id of a platinum unlocked as a result, or SCE_NP_TROPHY_INVALID_TROPHY_ID.
+static u32 np_trophy_unlock_impl(ppu_thread& ppu, trophy_context_t* ctxt, const ct_rules_set& rules, s32 trophyId, bool unlock_self)
+{
+	vm::var<CellRtcTick> tick;
+	if (error_code error = cellRtcGetCurrentTick(ppu, tick))
+	{
+		sceNpTrophy.error("sceNpTrophyUnlockTrophy: Failed to get timestamp: 0x%x", +error);
+	}
+
+	if (unlock_self && ctxt->tropusr->UnlockTrophy(trophyId, tick->tick, tick->tick))
+	{
+		sceNpTrophy.notice("Trophy %d unlocked", trophyId);
+	}
+
+	// TODO: Make sure that unlocking platinum trophies is properly implemented and improve upon it
+	const std::string& config_path = vfs::get("/dev_hdd0/home/" + Emu.GetUsr() + "/trophy/" + ctxt->trp_name + "/TROPCONF.SFM");
+	const u32 unlocked_platinum_id = ctxt->tropusr->GetUnlockedPlatinumID(trophyId, config_path, rules.removed.empty() ? nullptr : &rules.removed);
+
+	if (unlocked_platinum_id != SCE_NP_TROPHY_INVALID_TROPHY_ID)
+	{
+		sceNpTrophy.warning("sceNpTrophyUnlockTrophy: All requirements for unlocking the platinum trophy (ID = %d) were met.)", unlocked_platinum_id);
+
+		if (ctxt->tropusr->UnlockTrophy(unlocked_platinum_id, tick->tick, tick->tick))
+		{
+			sceNpTrophy.success("You unlocked a platinum trophy! Hooray!!!");
+		}
+	}
+
+	if (!unlock_self && unlocked_platinum_id == SCE_NP_TROPHY_INVALID_TROPHY_ID)
+	{
+		// Nothing changed
+		return unlocked_platinum_id;
+	}
+
+	const std::string trophyPath = "/dev_hdd0/home/" + Emu.GetUsr() + "/trophy/" + ctxt->trp_name + "/TROPUSR.DAT";
+	if (!ctxt->tropusr->Save(trophyPath))
+	{
+		sceNpTrophy.error("sceNpTrophyUnlockTrophy: failed to save '%s'", trophyPath);
+	}
+
+	if (g_cfg.misc.show_trophy_popups)
+	{
+		if (unlock_self)
+		{
+			// Enqueue popup for the regular trophy
+			show_trophy_notification(ctxt, trophyId);
+		}
+
+		if (unlocked_platinum_id != SCE_NP_TROPHY_INVALID_TROPHY_ID)
+		{
+			// Enqueue popup for the holy platinum trophy
+			show_trophy_notification(ctxt, unlocked_platinum_id);
+		}
+	}
+
+	if (g_cfg.net.psn_status == np_psn_status::psn_rpcn)
+	{
+		// Custom trophies, and a platinum earned with a modified trophy set, stay on this device
+		auto& np = g_fxo->get<named_thread<np::np_handler>>();
+
+		if (unlock_self && !rules.is_custom(trophyId))
+			np.rpcn_trophy_unlock(ctxt->comm_id, trophyId, static_cast<s64>(tick->tick));
+
+		if (unlocked_platinum_id != SCE_NP_TROPHY_INVALID_TROPHY_ID && !rules.active())
+			np.rpcn_trophy_unlock(ctxt->comm_id, static_cast<s32>(unlocked_platinum_id), static_cast<s64>(tick->tick));
+	}
+
+	return unlocked_platinum_id;
+}
+
+// Trophy sets for games WITHOUT trophy support.
+//
+// Such a game never calls sceNpTrophyRegisterContext, so there is no set to add custom trophies
+// to. If a rules file named after the game's serial exists
+// (/dev_hdd0/home/<user>/trophy_rules/BLUS30256.yml), the emulator makes the set itself: a
+// trophy folder named after the serial with definitions built from the file's `custom:` list,
+// the game's own ICON0.PNG, and a progress file. Nothing about it is ever sent online.
+//
+//   title: "50 Cent: Blood on the Sand"   # optional, the game's own title otherwise
+//   game: PPU-...                         # optional, as for any rules file
+//   custom:
+//     - name: "First blood"
+//       ...
+//
+// Tried once per boot, on the first rules check. Must be called with
+// sce_np_trophy_manager::mtx held.
+static trophy_context_t* ct_get_synthetic()
+{
+	auto& state = g_fxo->get<custom_trophy_state>();
+
+	if (state.synthetic_tried)
+	{
+		return state.synthetic.get();
+	}
+
+	state.synthetic_tried = true;
+
+	const std::string title_id = Emu.GetTitleID();
+
+	if (title_id.size() < 4 || title_id.size() > 16 || !std::all_of(title_id.begin(), title_id.end(), [](char c) { return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); }))
+	{
+		return nullptr;
+	}
+
+	const std::string home = "/dev_hdd0/home/" + Emu.GetUsr();
+	const std::string rules_path = vfs::get(home + "/trophy_rules/" + title_id + ".yml");
+
+	if (rules_path.empty() || !fs::is_file(rules_path))
+	{
+		return nullptr;
+	}
+
+	// The set's title: the file's, or the game's own
+	std::string title = Emu.GetTitle();
+
+	if (fs::file file{rules_path})
+	{
+		const auto loaded = yaml_load(file.to_string());
+
+		if (loaded.second.empty() && loaded.first.IsMap())
+		{
+			if (const YAML::Node node = loaded.first["title"]; node && node.IsScalar() && !node.Scalar().empty())
+			{
+				title = node.Scalar();
+			}
+		}
+	}
+
+	const std::string set_path = home + "/trophy/" + title_id;
+	const std::string dir = vfs::get(set_path + "/");
+
+	if (dir.empty() || !fs::create_path(dir))
+	{
+		sceNpTrophy.error("Custom trophy rules: cannot create the trophy folder for %s", title_id);
+		return nullptr;
+	}
+
+	// Base definitions with no trophies of their own, rebuilt on every boot; ct_merge_custom
+	// adds the pack's trophies to them
+	const std::string conf = fmt::format(
+		"<trophyconf version=\"1.1\">\n"
+		" <npcommid>%s</npcommid>\n"
+		" <trophyset-version>01.00</trophyset-version>\n"
+		" <parental-level license-area=\"default\">0</parental-level>\n"
+		" <title-name>%s</title-name>\n"
+		" <title-detail>Custom trophies</title-detail>\n"
+		"</trophyconf>\n",
+		title_id, ct_xml_escape(title.empty() ? title_id : title));
+
+	for (const char* name : {"TROPCONF.SFM", "TROP.SFM"})
+	{
+		fs::file out{dir + name, fs::rewrite};
+
+		if (!out || out.write(conf.data(), conf.size()) != conf.size())
+		{
+			sceNpTrophy.error("Custom trophy rules: cannot write %s for %s", name, title_id);
+			return nullptr;
+		}
+	}
+
+	// The game's icon, for the set and for custom trophies without one of their own
+	for (const bool disc : {true, false})
+	{
+		const std::string sfo_dir = Emu.GetSfoDir(disc);
+
+		if (!sfo_dir.empty() && fs::copy_file(sfo_dir + "/ICON0.PNG", dir + "ICON0.PNG", true))
+		{
+			break;
+		}
+	}
+
+	// Load the rules and merge the custom trophies into the definitions written above
+	ct_rules_set& rules = ct_get_rules(title_id, true);
+	rules.original_count = 0; // every trophy in this set is custom
+
+	if (rules.defined_trophies == 0)
+	{
+		sceNpTrophy.error("Custom trophy rules: %s has no usable custom trophies, so no trophy set was made", title_id);
+		return nullptr;
+	}
+
+	auto ctxt = std::make_unique<trophy_context_t>();
+	ctxt->trp_name = title_id;
+	ctxt->tropusr = std::make_unique<TROPUSRLoader>();
+
+	const std::string usr_path = set_path + "/TROPUSR.DAT";
+	const std::string conf_path = set_path + "/TROPCONF.SFM";
+
+	if (!ctxt->tropusr->Load(usr_path, conf_path).success)
+	{
+		sceNpTrophy.error("Custom trophy rules: cannot create TROPUSR.DAT for %s", title_id);
+		return nullptr;
+	}
+
+	if (ctxt->tropusr->GetTrophiesCount() != rules.defined_trophies && !ctxt->tropusr->SyncWithConfig(usr_path, conf_path))
+	{
+		sceNpTrophy.error("Custom trophy rules: cannot resize TROPUSR.DAT for %s", title_id);
+	}
+
+	// So that the trophy list (home menu, app) shows this set as the running game's
+	{
+		current_trophy_name& current_id = g_fxo->get<current_trophy_name>();
+		std::lock_guard lock(current_id.mtx);
+
+		if (current_id.name.empty())
+		{
+			current_id.name = title_id;
+		}
+	}
+
+	sceNpTrophy.success("Custom trophy rules: made a trophy set for %s (%s) with %d trophies", title_id, title, rules.defined_trophies);
+
+	state.synthetic = std::move(ctxt);
+	return state.synthetic.get();
+}
+
+// The trophy sets the rules run on: the ones the game registered, or the one made for it.
+// Must be called with sce_np_trophy_manager::mtx held.
+static std::vector<trophy_context_t*> ct_contexts(bool game_has_trophies)
+{
+	std::vector<trophy_context_t*> contexts;
+
+	if (game_has_trophies)
+	{
+		for (u32 context = trophy_context_t::id_base; context < trophy_context_t::id_base + trophy_context_t::id_count; context++)
+		{
+			if (const auto ctxt = idm::check_unlocked<trophy_context_t>(context); ctxt && !ctxt->read_only && ctxt->tropusr)
+			{
+				contexts.push_back(ctxt);
+			}
+		}
+	}
+
+	if (contexts.empty())
+	{
+		if (trophy_context_t* synthetic = ct_get_synthetic())
+		{
+			contexts.push_back(synthetic);
+		}
+	}
+
+	return contexts;
+}
+
+bool sceNpTrophy_game_uses_trophies()
+{
+	return g_fxo->get<sce_np_trophy_manager>().is_initialized;
+}
+
+// Locks a custom trophy again and forgets its rule's progress (sequence step, counts), so that
+// a rule can be tested repeatedly. index is the trophy's position in the rules file's custom
+// list. For trophy authors; called from the app, not from the game.
+bool sceNpTrophy_reset_custom(u32 index)
+{
+	auto& trophy_manager = g_fxo->get<sce_np_trophy_manager>();
+
+	std::scoped_lock lock(trophy_manager.mtx);
+
+	bool done = false;
+
+	for (trophy_context_t* ctxt : ct_contexts(trophy_manager.is_initialized))
+	{
+		ct_rules_set& rules = ct_get_rules(ctxt->trp_name);
+
+		if (index >= rules.custom.size() || rules.defined_trophies < rules.custom.size())
+		{
+			continue;
+		}
+
+		const u32 id = rules.defined_trophies - static_cast<u32>(rules.custom.size()) + index;
+
+		if (!ctxt->tropusr->LockTrophy(id))
+		{
+			continue;
+		}
+
+		const std::string path = "/dev_hdd0/home/" + Emu.GetUsr() + "/trophy/" + ctxt->trp_name + "/TROPUSR.DAT";
+
+		if (!ctxt->tropusr->Save(path))
+		{
+			sceNpTrophy.error("Custom trophy rules: failed to save '%s'", path);
+		}
+
+		for (ct_rule& rule : rules.rules)
+		{
+			if (rule.id == static_cast<s32>(id))
+			{
+				rule.current = 0;
+				rule.progress_shown = -1;
+			}
+		}
+
+		ct_for_each_op(rules, [&](s32 rule_id, ct_op& op)
+		{
+			if (rule_id == static_cast<s32>(id))
+			{
+				op.state = 0;
+				op.has_state = false;
+				op.flag = false;
+			}
+		});
+
+		rules.progress_dirty = true;
+		rules.next_progress_write = 0;
+		ct_save_counts(rules, ctxt->trp_name);
+
+		sceNpTrophy.success("Custom trophy rules: trophy %d was reset", id);
+		done = true;
+	}
+
+	return done;
+}
+
+// Called regularly from cellSysutilCheckCallback (which games call about once per frame)
+void sceNpTrophy_check_custom_rules(ppu_thread& ppu)
+{
+	static atomic_t<u64> s_next_check = 0;
+	static atomic_t<u64> s_interval = 250'000;
+
+	const u64 now = get_system_time();
+
+	if (now < s_next_check)
+	{
+		return;
+	}
+
+	s_next_check = now + s_interval.load();
+
+	// Button rules need to see every frame, everything else is fine at 4x a second
+	bool any_fast = false;
+
+	auto& trophy_manager = g_fxo->get<sce_np_trophy_manager>();
+
+	std::unique_lock lock(trophy_manager.mtx, std::try_to_lock);
+
+	if (!lock)
+	{
+		return;
+	}
+
+	// A game without trophy support never initialises the trophy manager; its set (if a rules
+	// file asks for one) is made by ct_get_synthetic
+	for (trophy_context_t* ctxt : ct_contexts(trophy_manager.is_initialized))
+	{
+		ct_rules_set& rules = ct_get_rules(ctxt->trp_name);
+
+		if (!rules.resize_tried && rules.defined_trophies != 0 && ctxt->tropusr->GetTrophiesCount() != rules.defined_trophies)
+		{
+			// A savestate was loaded after custom trophies were added or removed: the progress
+			// data still has the old size. Same fix as in sceNpTrophyRegisterContext.
+			rules.resize_tried = true;
+
+			const std::string dir = "/dev_hdd0/home/" + Emu.GetUsr() + "/trophy/" + ctxt->trp_name;
+
+			if (!ctxt->tropusr->SyncWithConfig(dir + "/TROPUSR.DAT", dir + "/TROPCONF.SFM"))
+			{
+				sceNpTrophy.error("Custom trophy rules: failed to resize TROPUSR.DAT after loading a savestate");
+			}
+		}
+
+		if (!rules.active())
+		{
+			continue;
+		}
+
+		any_fast |= rules.fast;
+
+		const s32 count = static_cast<s32>(ctxt->tropusr->GetTrophiesCount());
+
+		if (!rules.platinum_checked)
+		{
+			// Removing trophies may have completed a platinum that was already earned otherwise
+			rules.platinum_checked = true;
+
+			// First check for this set: say so if a rule can never fire
+			for (const ct_rule& rule : rules.rules)
+			{
+				if (rule.id >= count)
+				{
+					CT_PROBLEM("trophy %d has a rule but the trophy data only has %d trophies. TROPHY.TRP and TROPUSR.DAT must both include it.", rule.id, count);
+				}
+				else if (ctxt->tropusr->GetTrophyUnlockState(rule.id))
+				{
+					sceNpTrophy.notice("Custom trophy rules: trophy %d is already unlocked", rule.id);
+				}
+				else
+				{
+					sceNpTrophy.notice("Custom trophy rules: trophy %d is locked, watching (%s)", rule.id, rule.text);
+				}
+			}
+
+			for (const u32 id : rules.removed)
+			{
+				if (id < static_cast<u32>(count))
+				{
+					np_trophy_unlock_impl(ppu, ctxt, rules, static_cast<s32>(id), false);
+				}
+			}
+		}
+
+		ct_eval_ctx eval_ctx{};
+		eval_ctx.tropusr = ctxt->tropusr.get();
+		// A long gap means the game was paused or stalled; that time does not count
+		eval_ctx.dt_us = rules.last_check ? std::min<u64>(now - rules.last_check, 1'000'000) : 0;
+		rules.last_check = now;
+
+		for (ct_rule& rule : rules.rules)
+		{
+			if (rule.id < 0 || rule.id >= count)
+			{
+				continue;
+			}
+
+			if (ctxt->tropusr->GetTrophyUnlockState(rule.id))
+			{
+				continue;
+			}
+
+			if (rule.all_others)
+			{
+				// Custom platinum: everything else that still exists has to be unlocked
+				bool all = true;
+
+				for (s32 other = 0; other < count && all; other++)
+				{
+					if (other == rule.id || rules.is_removed(other) || ctxt->tropusr->GetTrophyGrade(other) == SCE_NP_TROPHY_GRADE_PLATINUM)
+					{
+						continue;
+					}
+
+					all = !!ctxt->tropusr->GetTrophyUnlockState(other);
+				}
+
+				if (all)
+				{
+					sceNpTrophy.success("Custom trophy rules: custom platinum %d earned", rule.id);
+					np_trophy_unlock_impl(ppu, ctxt, rules, rule.id, true);
+				}
+
+				continue;
+			}
+
+			if (ctxt->tropusr->GetTrophyGrade(rule.id) == SCE_NP_TROPHY_GRADE_PLATINUM)
+			{
+				continue;
+			}
+
+			const bool earned = ct_test(rule, eval_ctx);
+
+			if (rule.has_progress)
+			{
+				const ct_condition& cond = rule.steps[0].clauses[0][0][0];
+				const s64 shown = cond.readable && cond.last >= 0 && cond.last < 9.0e15 ? static_cast<s64>(cond.last) : -1;
+
+				if (shown != rule.progress_shown)
+				{
+					rule.progress_shown = shown;
+					rules.progress_dirty = true;
+				}
+			}
+
+			if (!earned)
+			{
+				continue;
+			}
+
+			sceNpTrophy.success("Custom trophy rules: trophy %d earned (%s)", rule.id, rule.text);
+			np_trophy_unlock_impl(ppu, ctxt, rules, rule.id, true);
+			rules.progress_dirty = true;
+		}
+
+		// Progress of simple counting rules, for the trophy list ("37 / 50")
+		if (rules.progress_dirty && now >= rules.next_progress_write)
+		{
+			rules.progress_dirty = false;
+			rules.next_progress_write = now + 2'000'000;
+
+			std::string text;
+
+			for (const ct_rule& rule : rules.rules)
+			{
+				if (rule.has_progress && rule.progress_shown >= 0 && rule.id >= 0 && rule.id < count && !ctxt->tropusr->GetTrophyUnlockState(rule.id))
+				{
+					fmt::append(text, "%d %d %d\n", rule.id, rule.progress_shown, static_cast<s64>(rule.progress_target));
+				}
+			}
+
+			const std::string path = vfs::get("/dev_hdd0/home/" + Emu.GetUsr() + "/trophy/" + ctxt->trp_name + "/TROPPROG.TXT");
+
+			if (fs::file out{path, fs::rewrite})
+			{
+				out.write(text.data(), text.size());
+			}
+		}
+
+		if (rules.has_counts && now >= rules.next_counts_write)
+		{
+			rules.next_counts_write = now + 5'000'000;
+			ct_save_counts(rules, ctxt->trp_name);
+		}
+	}
+
+	s_interval = any_fast ? 12'000 : 250'000;
 }
 
 // Functions
@@ -718,7 +3098,24 @@ error_code sceNpTrophyRegisterContext(ppu_thread& ppu, u32 context, u32 handle, 
 	const std::string trophyUsrPath = trophyPath + "/TROPUSR.DAT";
 	const std::string trophyConfPath = trophyPath + "/TROPCONF.SFM";
 
+	// (Re)load the optional custom trophy rules that belong to this trophy set, and add its
+	// custom trophies to the definitions that were just installed
+	const ct_rules_set custom_rules = ct_get_rules(ctxt->trp_name, true);
+	const u32 defined_trophies = custom_rules.defined_trophies;
+
 	ensure(tropusr->Load(trophyUsrPath, trophyConfPath).success);
+
+	if (defined_trophies != 0 && tropusr->GetTrophiesCount() != defined_trophies)
+	{
+		// The trophy set grew or shrank (custom trophies were added or removed): rebuild the
+		// progress file for the new set, keeping everything that was already earned
+		sceNpTrophy.warning("sceNpTrophyRegisterContext(): TROPUSR.DAT has %d trophies but %d are defined, resizing", tropusr->GetTrophiesCount(), defined_trophies);
+
+		if (!tropusr->SyncWithConfig(trophyUsrPath, trophyConfPath))
+		{
+			sceNpTrophy.error("sceNpTrophyRegisterContext(): Failed to resize TROPUSR.DAT");
+		}
+	}
 
 	if (g_cfg.net.psn_status == np_psn_status::psn_rpcn)
 	{
@@ -729,6 +3126,13 @@ error_code sceNpTrophyRegisterContext(ppu_thread& ppu, u32 context, u32 handle, 
 		local_unlocked.reserve(trophy_count);
 		for (u32 i = 0; i < trophy_count; i++)
 		{
+			// Custom trophies (and a platinum from a modified set) are never reported to the server
+			if (custom_rules.is_custom(static_cast<s32>(i)) || custom_rules.is_removed(static_cast<s32>(i)))
+				continue;
+
+			if (custom_rules.active() && tropusr->GetTrophyGrade(i) == SCE_NP_TROPHY_GRADE_PLATINUM)
+				continue;
+
 			if (tropusr->GetTrophyUnlockState(static_cast<s32>(i)))
 			{
 				local_unlocked.emplace_back(
@@ -746,7 +3150,7 @@ error_code sceNpTrophyRegisterContext(ppu_thread& ppu, u32 context, u32 handle, 
 		bool changed = false;
 		for (const auto& [tid, ts] : srv_trophies)
 		{
-			if (tid >= 0 && tid < static_cast<s32>(trophy_count) && ts >= 0 && !tropusr->GetTrophyUnlockState(tid))
+			if (tid >= 0 && tid < static_cast<s32>(trophy_count) && ts >= 0 && !tropusr->GetTrophyUnlockState(tid) && !custom_rules.is_custom(tid) && !custom_rules.is_removed(tid))
 			{
 				static_cast<void>(tropusr->UnlockTrophy(tid, static_cast<u64>(ts), static_cast<u64>(ts)));
 				changed = true;
@@ -1096,6 +3500,8 @@ error_code sceNpTrophyUnlockTrophy(ppu_thread& ppu, u32 context, u32 handle, s32
 		return SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID;
 	}
 
+	ct_trace_request(ppu, ctxt, trophyId, !!ctxt->tropusr->GetTrophyUnlockState(trophyId));
+
 	if (ctxt->tropusr->GetTrophyGrade(trophyId) == SCE_NP_TROPHY_GRADE_PLATINUM)
 	{
 		return SCE_NP_TROPHY_ERROR_CANNOT_UNLOCK_PLATINUM;
@@ -1106,62 +3512,29 @@ error_code sceNpTrophyUnlockTrophy(ppu_thread& ppu, u32 context, u32 handle, s32
 		return SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED;
 	}
 
-	vm::var<CellRtcTick> tick;
-	if (error_code error = cellRtcGetCurrentTick(ppu, tick))
+	const ct_rules_set& rules = ct_get_rules(ctxt->trp_name);
+
+	if (rules.is_removed(trophyId))
 	{
-		sceNpTrophy.error("sceNpTrophyUnlockTrophy: Failed to get timestamp: 0x%x", +error);
-	}
+		// Removed by the custom trophy rules: pretend it worked, but only re-check the platinum
+		sceNpTrophy.notice("sceNpTrophyUnlockTrophy: trophy %d is removed by the custom trophy rules, ignoring", trophyId);
 
-	if (ctxt->tropusr->UnlockTrophy(trophyId, tick->tick, tick->tick))
-	{
-		sceNpTrophy.notice("Trophy %d unlocked", trophyId);
-	}
+		const u32 platinum = np_trophy_unlock_impl(ppu, ctxt, rules, trophyId, false);
 
-	// TODO: Make sure that unlocking platinum trophies is properly implemented and improve upon it
-	const std::string& config_path = vfs::get("/dev_hdd0/home/" + Emu.GetUsr() + "/trophy/" + ctxt->trp_name + "/TROPCONF.SFM");
-	const u32 unlocked_platinum_id = ctxt->tropusr->GetUnlockedPlatinumID(trophyId, config_path);
-
-	if (unlocked_platinum_id != SCE_NP_TROPHY_INVALID_TROPHY_ID)
-	{
-		sceNpTrophy.warning("sceNpTrophyUnlockTrophy: All requirements for unlocking the platinum trophy (ID = %d) were met.)", unlocked_platinum_id);
-
-		if (ctxt->tropusr->UnlockTrophy(unlocked_platinum_id, tick->tick, tick->tick))
+		if (platinumId)
 		{
-			sceNpTrophy.success("You unlocked a platinum trophy! Hooray!!!");
+			*platinumId = platinum;
 		}
+
+		return CELL_OK;
 	}
+
+	const u32 unlocked_platinum_id = np_trophy_unlock_impl(ppu, ctxt, rules, trophyId, true);
 
 	if (platinumId)
 	{
 		*platinumId = unlocked_platinum_id;
 		sceNpTrophy.warning("sceNpTrophyUnlockTrophy: platinumId was set to %d", unlocked_platinum_id);
-	}
-
-	const std::string trophyPath = "/dev_hdd0/home/" + Emu.GetUsr() + "/trophy/" + ctxt->trp_name + "/TROPUSR.DAT";
-	if (!ctxt->tropusr->Save(trophyPath))
-	{
-		sceNpTrophy.error("sceNpTrophyUnlockTrophy: failed to save '%s'", trophyPath);
-	}
-
-	if (g_cfg.misc.show_trophy_popups)
-	{
-		// Enqueue popup for the regular trophy
-		show_trophy_notification(ctxt, trophyId);
-
-		if (unlocked_platinum_id != SCE_NP_TROPHY_INVALID_TROPHY_ID)
-		{
-			// Enqueue popup for the holy platinum trophy
-			show_trophy_notification(ctxt, unlocked_platinum_id);
-		}
-	}
-
-	if (g_cfg.net.psn_status == np_psn_status::psn_rpcn)
-	{
-		auto& np = g_fxo->get<named_thread<np::np_handler>>();
-		np.rpcn_trophy_unlock(ctxt->comm_id, trophyId, static_cast<s64>(tick->tick));
-
-		if (unlocked_platinum_id != SCE_NP_TROPHY_INVALID_TROPHY_ID)
-			np.rpcn_trophy_unlock(ctxt->comm_id, static_cast<s32>(unlocked_platinum_id), static_cast<s64>(tick->tick));
 	}
 
 	return CELL_OK;

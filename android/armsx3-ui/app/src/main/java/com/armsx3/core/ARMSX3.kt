@@ -397,6 +397,10 @@ class ARMSX3 {
      *  Patch count, or -1 when the content does not parse or the write fails. */
     external fun patchesWrite(file: String, content: String): Int
     external fun patchesList(serial: String): String
+    /** Memory search for custom trophy rules: one text command in, text out ("ok ..." or
+     *  "err ..."). Commands are documented at _armsx3_memSearch in armsx3-core.cpp. Blocking
+     *  (a new search scans all guest memory) -- call from Dispatchers.IO. */
+    external fun memSearch(command: String): String
     external fun probeDiscInfo(isoPath: String, iconOut: String): String
     /** Swap the running game's disc. 0 swapped, 1 the game takes no swaps, 2 not a disc,
      *  3 the game never released its disc, 4 the core refused the new one. */

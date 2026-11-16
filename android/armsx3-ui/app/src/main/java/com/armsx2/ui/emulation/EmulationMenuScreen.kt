@@ -1758,6 +1758,13 @@ private fun TrophiesPane(viewModel: EmulationMenuViewModel) {
         viewModel::openTrophies,
     )
     Spacer(Modifier.height(4.dp))
+    CompactAction(
+        "Memory search (custom trophies)",
+        "🔎",
+        Modifier.fillMaxWidth(),
+        viewModel::openMemorySearch,
+    )
+    Spacer(Modifier.height(4.dp))
 
     SectionCard(str("trophies.title")) {
         when {

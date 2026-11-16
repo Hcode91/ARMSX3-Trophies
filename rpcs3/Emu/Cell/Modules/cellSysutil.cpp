@@ -12,6 +12,7 @@
 #include "Emu/Cell/lv2/sys_prx.h"
 #include "Emu/savestate_utils.hpp"
 #include "cellSysutil.h"
+#include "sceNpTrophy.h"
 #include "sysPrxForUser.h"
 
 #include "Utilities/StrUtil.h"
@@ -692,6 +693,9 @@ error_code cellSysutilGetSystemParamString(CellSysutilParamId id, vm::ptr<char> 
 error_code cellSysutilCheckCallback(ppu_thread& ppu)
 {
 	cellSysutil.trace("cellSysutilCheckCallback()");
+
+	// Custom trophy rules (PocketTrophy): cheap unless a rules file is present
+	sceNpTrophy_check_custom_rules(ppu);
 
 	auto& cbm = g_fxo->get<sysutil_cb_manager>();
 

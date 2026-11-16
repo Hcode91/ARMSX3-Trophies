@@ -2,6 +2,7 @@
 #include "stdafx.h"
 #include "Utilities/rXml.h"
 #include "Utilities/File.h"
+#include <set>
 
 struct TROPUSRHeader
 {
@@ -98,10 +99,14 @@ public:
 	[[nodiscard]] load_result Load(std::string_view filepath, std::string_view configpath);
 	[[nodiscard]] bool Save(std::string_view filepath);
 
+	// Rebuild the tables for the trophies in configpath, keeping the state of every trophy
+	// that exists in both (PocketTrophy: custom trophies change the size of a set)
+	[[nodiscard]] bool SyncWithConfig(std::string_view filepath, std::string_view configpath);
+
 	[[nodiscard]] u32 GetTrophiesCount() const;
 	[[nodiscard]] u32 GetUnlockedTrophiesCount() const;
 
-	[[nodiscard]] u32 GetUnlockedPlatinumID(u32 trophy_id, const std::string& config_path);
+	[[nodiscard]] u32 GetUnlockedPlatinumID(u32 trophy_id, const std::string& config_path, const std::set<u32>* ignored_ids = nullptr);
 
 	[[nodiscard]] u32 GetTrophyGrade(u32 id) const;
 	[[nodiscard]] u32 GetTrophyUnlockState(u32 id) const;

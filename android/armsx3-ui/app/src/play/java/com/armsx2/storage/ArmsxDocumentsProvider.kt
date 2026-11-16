@@ -120,7 +120,7 @@ class ArmsxDocumentsProvider : android.provider.DocumentsProvider() {
         cursor.newRow().apply {
             add(Root.COLUMN_ROOT_ID, ROOT_ID)
             add(Root.COLUMN_DOCUMENT_ID, "")
-            add(Root.COLUMN_TITLE, "ARMSX3")
+            add(Root.COLUMN_TITLE, "PocketTrophy")
             // The path is the summary because a user dropping a 40 GB game in wants to know
             // WHICH volume they are writing to, and internal and SD card look identical here.
             add(Root.COLUMN_SUMMARY, root.absolutePath)

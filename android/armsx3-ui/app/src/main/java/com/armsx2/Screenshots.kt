@@ -17,7 +17,7 @@ import java.io.File
  * the button, sees "Saved screenshot to …" and then cannot find the file anywhere.
  */
 object Screenshots {
-    private const val ALBUM = "ARMSX3"
+    private const val ALBUM = "PocketTrophy"
 
     /** Fire-and-forget: queues the capture on the GS thread, then publishes it once it lands. */
     fun capture(context: Context) {

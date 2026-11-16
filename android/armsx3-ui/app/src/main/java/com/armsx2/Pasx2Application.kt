@@ -75,7 +75,7 @@ class Pasx2Application : Application(), ImageLoaderFactory {
 				runCatching {
 					File(logDir, "crash-${System.currentTimeMillis()}.txt").writeText(
 						buildString {
-							appendLine("ARMSX3 crash log")
+							appendLine("PocketTrophy crash log (ARMSX3 fork)")
 							appendLine("time=${System.currentTimeMillis()}")
 							appendLine("thread=${thread.name}")
 							appendLine(

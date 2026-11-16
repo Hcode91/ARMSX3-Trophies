@@ -808,7 +808,7 @@ open class MainActivityRuntime : ComponentActivity() {
                             // cannot be read. Nothing is broken and nothing else was lost, so say
                             // that rather than leaving an enum name to be interpreted.
                             "SavestateVersionUnsupported" ->
-                                ". That save state was made by an older version of ARMSX3 and can no longer be loaded. Start the game normally and make a new one."
+                                ". That save state was made by an older version of PocketTrophy and can no longer be loaded. Start the game normally and make a new one."
                             else -> ""
                         }
                         instance?.let { act ->

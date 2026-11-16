@@ -178,6 +178,7 @@ class EmulationMenuViewModel(application: Application) : AndroidViewModel(applic
             }
             EmulationMenuTab.Trophies -> when (state.value.selectedAction) {
                 0 -> openTrophies()
+                1 -> openMemorySearch()
             }
         }
     }
@@ -375,6 +376,8 @@ class EmulationMenuViewModel(application: Application) : AndroidViewModel(applic
 
     /** Open the full trophy list over the paused game, scoped to the running title. */
     fun openTrophies() = com.armsx2.ui.WindowImpl.openInGameScreen(com.armsx2.ui.InGameScreen.Trophies)
+    /** Memory search for custom trophy rules (PocketTrophy). */
+    fun openMemorySearch() = com.armsx2.ui.WindowImpl.openInGameScreen(com.armsx2.ui.InGameScreen.MemorySearch)
 
     fun updateSettings(transform: (Settings) -> Settings) {
         // ★ Transform the LIVE shared settings, not this screen's snapshot. state.value.settings is
@@ -401,7 +404,8 @@ class EmulationMenuViewModel(application: Application) : AndroidViewModel(applic
         EmulationMenuTab.Achievements -> 2
         // Just the "view trophies" gateway. The rows below it are read-only, and the
         // show-hidden toggle lives on the full screen the gateway opens.
-        EmulationMenuTab.Trophies -> 1
+        // ...plus the memory search for custom trophy rules.
+        EmulationMenuTab.Trophies -> 2
     }
 
     private fun Int.floorMod(modulus: Int): Int = ((this % modulus) + modulus) % modulus

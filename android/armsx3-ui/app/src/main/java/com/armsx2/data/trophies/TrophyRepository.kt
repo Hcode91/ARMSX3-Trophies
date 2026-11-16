@@ -159,9 +159,11 @@ object TrophyRepository {
         val titleId = runCatching { ARMSX3.instance.getTitleId() }
             .getOrNull()?.trim()?.takeIf { it.isNotEmpty() } ?: return emptyList()
         // TROPDIR/<NPWRxxxxx_00>/TROPHY.TRP — the folder names are the comm ids.
+        // Last resort: a set the core made for a game without trophies is named after the
+        // serial itself (PocketTrophy, see ct_get_synthetic in sceNpTrophy.cpp).
         return File(hdd0(), "game/$titleId/TROPDIR").listFiles().orEmpty()
             .filter { it.isDirectory }
-            .map { it.name }
+            .map { it.name } + titleId
     }
 
     private fun readGame(dir: File): Game? {
@@ -183,12 +185,34 @@ object TrophyRepository {
             emptyMap()
         }
 
-        val trophies = parsed.trophies.map { def ->
+        // Trophies "removed" by the custom trophy rules are hidden here; the core ignores
+        // them too (see sceNpTrophy.cpp), so they no longer count towards the totals.
+        // ...plus what the core itself reported as hidden the last time the game ran
+        // (TROPHIDE.TXT: one id per line; includes deleted custom trophies).
+        val removed = removedTrophyIds(dir) + runCatching {
+            File(dir, "TROPHIDE.TXT").takeIf { it.isFile }?.readLines().orEmpty().mapNotNull { it.trim().toIntOrNull() }
+        }.getOrDefault(emptyList())
+        // "37 / 50" for trophies with a simple counting rule, written by the core while the
+        // game runs (TROPPROG.TXT: one "id now target" line per trophy).
+        val progress = runCatching {
+            File(dir, "TROPPROG.TXT").takeIf { it.isFile }?.readLines().orEmpty().mapNotNull { line ->
+                val parts = line.trim().split(' ')
+                val id = parts.getOrNull(0)?.toIntOrNull()
+                val now = parts.getOrNull(1)?.toLongOrNull()
+                val target = parts.getOrNull(2)?.toLongOrNull()
+                if (id != null && now != null && target != null && target > 0) id to "${minOf(now, target)} / $target" else null
+            }.toMap()
+        }.getOrDefault(emptyMap())
+
+        val trophies = parsed.trophies.filter { it.id !in removed }.map { def ->
             val entry = state[def.id]
             Trophy(
                 id = def.id,
                 name = def.name,
-                description = def.detail,
+                description = progress[def.id]
+                    ?.takeIf { entry?.unlocked != true && !def.hidden }
+                    ?.let { if (def.detail.isBlank()) it else "${def.detail}  ($it)" }
+                    ?: def.detail,
                 // ttype from the XML is what the native overlay uses; the grade duplicated in
                 // TROPUSR table 4 is the fallback for a set with a missing/odd ttype.
                 grade = def.grade.takeIf { it != Grade.Unknown } ?: entry?.grade ?: Grade.Unknown,
@@ -209,6 +233,52 @@ object TrophyRepository {
             icon = File(dir, "ICON0.PNG").takeIf { it.isFile },
             trophies = trophies,
         )
+    }
+
+    /**
+     * Ids listed under `remove:` in the set's custom trophy rules file, if it has one.
+     *
+     * Same lookup order as the core's ct_load in sceNpTrophy.cpp: the loose file in
+     * home/<user>/trophy_rules/<NPWRxxxxx_00>.yml wins over the TROPRULES.YML that was
+     * installed from TROPHY.TRP. Only the two usual spellings of a YAML list are read:
+     * `remove: [5, 9]` and a block of `- 5` lines under `remove:`.
+     */
+    private fun removedTrophyIds(dir: File): Set<Int> {
+        val user = dir.parentFile?.parentFile
+        val candidates = listOfNotNull(
+            user?.let { File(File(it, "trophy_rules"), dir.name + ".yml") },
+            File(dir, "TROPRULES.YML"),
+        )
+        val file = candidates.firstOrNull { it.isFile } ?: return emptySet()
+        return runCatching {
+            val out = HashSet<Int>()
+            var inBlock = false
+            for (raw in file.readLines()) {
+                val line = raw.substringBefore('#').trimEnd()
+                if (line.isBlank()) continue
+                if (!raw.startsWith(" ") && !raw.startsWith("\t") && !raw.startsWith("-")) {
+                    // A top-level key.
+                    inBlock = false
+                    if (line.startsWith("remove:")) {
+                        val rest = line.removePrefix("remove:").trim()
+                        if (rest.isEmpty()) {
+                            inBlock = true
+                        } else {
+                            rest.trim('[', ']').split(',')
+                                .mapNotNull { it.trim().trim('"', '\'').toIntOrNull() }
+                                .forEach { out += it }
+                        }
+                    }
+                } else if (inBlock) {
+                    line.trim().removePrefix("-").trim().trim('"', '\'').toIntOrNull()
+                        ?.let { out += it }
+                }
+            }
+            out
+        }.getOrElse {
+            Log.w(TAG, "failed to read ${file.absolutePath}", it)
+            emptySet()
+        }
     }
 
     /**
